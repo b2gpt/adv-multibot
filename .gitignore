@@ -1,0 +1,6 @@
+*.session
+*.session-journal
+users.json
+settings.json
+downloads/
+.env
