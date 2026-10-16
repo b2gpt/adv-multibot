@@ -1,2 +1,6 @@
 kurigram
 tgcrypto
+py7zr>=0.22
+rarfile>=4.2
+yt-dlp[default]>=2025.3.31
+pymongo>=4.13

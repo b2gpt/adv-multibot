@@ -1,6 +1,14 @@
+Set-Content -Path .gitignore -Value @"
+venv/
+env/
+__pycache__/
+*.pyc
+.env
 *.session
 *.session-journal
 users.json
 settings.json
 downloads/
-.env
+thumbs/
+*.log
+"@
