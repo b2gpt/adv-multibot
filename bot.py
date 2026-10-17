@@ -1,11 +1,11 @@
-import asyncio, contextvars, ipaddress, json, logging, os, re, shutil, socket, subprocess, tarfile, time, uuid, zipfile
+import asyncio, contextvars, ipaddress, json, logging, mimetypes, os, re, shutil, socket, subprocess, tarfile, time, uuid, zipfile
 from email.message import Message
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from pyrogram import Client, enums, filters, idle
+from pyrogram import Client, StopPropagation, enums, filters, idle
 from pyrogram.file_id import FileId
 from pyrogram.types import (InlineKeyboardButton as B, InlineKeyboardMarkup as KB,
                             InputMediaDocument, InputMediaPhoto)
@@ -23,6 +23,7 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "3"))  # parallel jobs
 SUPPORT_GROUP = os.getenv("SUPPORT_GROUP", "")  # e.g. @MyHelpGroup (optional)
 OTHER_BOTS = os.getenv("OTHER_BOTS", "")  # optional: "Name|https://t.me/bot,Name2|https://t.me/bot2"
+OTHER_BOTS_FILE = Path("other_bots.json")
 WATERMARK = os.getenv("WATERMARK", "codextrms").strip()  # empty string = watermark OFF
 WM_FONT = os.getenv("WM_FONT", "")  # optional: path of a .ttf font for the watermark
 MAX_RANGE = int(os.getenv("MAX_RANGE", "2000"))  # max messages between two links
@@ -43,7 +44,13 @@ sem = asyncio.Semaphore(MAX_PARALLEL)
 sessions: dict[int, dict] = {}
 social_requests: dict[int, dict] = {}
 channel_copy_requests: dict[int, dict] = {}
+other_bots: list[dict[str, str]] = []
+bot_admin_wait: set[int] = set()
+url_bundle_requests: dict[int, dict] = {}
+image_requests: dict[int, dict] = {}
+pdf_requests: dict[int, dict] = {}
 channel_copy_lock = asyncio.Lock()
+operation_tasks: dict[asyncio.Task, tuple[int | None, object | None]] = {}
 
 app = Client("videobot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -103,6 +110,57 @@ async def initialize_user_store():
     async for document in mongo_users.find({}, {"username": 1}):
         users[str(document["_id"])] = document.get("username", "Unknown")
     logging.info("Loaded %d allowed users from MongoDB", len(users))
+
+
+def parse_other_bots_env() -> list[dict[str, str]]:
+    bots = []
+    for part in filter(None, (item.strip() for item in OTHER_BOTS.split(","))):
+        if "|" not in part:
+            logging.warning("Skipping invalid OTHER_BOTS entry: expected Name|URL")
+            continue
+        name, url = (value.strip() for value in part.split("|", 1))
+        if name and url:
+            bots.append({"id": uuid.uuid5(uuid.NAMESPACE_URL, url).hex[:12],
+                         "name": name, "url": url})
+    return bots
+
+
+async def initialize_other_bots():
+    global other_bots
+    defaults = parse_other_bots_env()
+    if mongo_metadata is not None:
+        await mongo_metadata.update_one(
+            {"_id": "other_bots"},
+            {"$setOnInsert": {"bots": defaults}},
+            upsert=True,
+        )
+        document = await mongo_metadata.find_one({"_id": "other_bots"}, {"bots": 1})
+        other_bots = document.get("bots", []) if document else []
+    elif OTHER_BOTS_FILE.exists():
+        other_bots = json.loads(OTHER_BOTS_FILE.read_text(encoding="utf-8"))
+    else:
+        other_bots = defaults
+        OTHER_BOTS_FILE.write_text(json.dumps(other_bots, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+
+
+async def get_other_bots() -> list[dict[str, str]]:
+    global other_bots
+    if mongo_metadata is not None:
+        document = await mongo_metadata.find_one({"_id": "other_bots"}, {"bots": 1})
+        other_bots = document.get("bots", []) if document else []
+    return other_bots
+
+
+async def save_other_bots(bots: list[dict[str, str]]):
+    global other_bots
+    if mongo_metadata is not None:
+        await mongo_metadata.update_one(
+            {"_id": "other_bots"}, {"$set": {"bots": bots}}, upsert=True)
+    else:
+        OTHER_BOTS_FILE.write_text(json.dumps(bots, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+    other_bots = bots
 
 
 async def persist_user_grant(uid: int, name: str):
@@ -278,9 +336,9 @@ async def info_cmd(c, m):
         f"Custom thumbnail: {'✅' if user_thumb(uid) else '❌ (auto cover)'}")
 
 # ---------------------------------------------------------------- thumbnails (/addthumb /delthumb)
-async def save_thumb(c, m, pm):
+async def save_thumb(c, m, pm, notify=True):
     THUMBS.mkdir(exist_ok=True)
-    uid = m.from_user.id
+    uid = pm.from_user.id if pm.from_user else m.from_user.id
     raw = await c.download_media(pm, file_name=str(THUMBS / f"{uid}_raw.jpg"))
     if not raw:
         raise RuntimeError("Download fail")
@@ -290,8 +348,9 @@ async def save_thumb(c, m, pm):
                   str(THUMBS / f"{uid}.jpg"))
     finally:
         Path(raw).unlink(missing_ok=True)
-    await m.reply("✅ Thumbnail save ho gaya. Ab aapke har upload ke video par yahi thumbnail lagega.\n"
-                  "Hatane ke liye: /delthumb")
+    if notify:
+        await m.reply("✅ Thumbnail save ho gaya. Ab aapke har upload ke video par yahi thumbnail lagega.\n"
+                      "Hatane ke liye: /delthumb")
 
 
 async def save_thumb_safe(c, m, pm):
@@ -303,6 +362,231 @@ async def save_thumb_safe(c, m, pm):
 
 def is_img(m):
     return bool(m and (m.photo or (m.document and (m.document.mime_type or "").startswith("image/"))))
+
+
+def image_tools_kb():
+    return KB([[G("🖼️ Set as Thumbnail", "img|thumb")],
+               [G("🔄 Convert Format", "img|formats"), G("🗜 Compress Size", "img|sizes")],
+               [G("📐 Resize / Resolution", "img|resolutions")],
+               [R("Cancel", "img|cancel")]])
+
+
+def image_format_kb():
+    return KB([[G("JPG", "img|convert|jpg"), G("PNG", "img|convert|png")],
+               [G("SVG", "img|convert|svg"), G("PDF", "img|convert|pdf")],
+               [P("⬅️ Back", "img|menu")]])
+
+
+def image_size_kb():
+    return KB([[G("< 20 KB", "img|compress|20"), G("< 50 KB", "img|compress|50")],
+               [G("< 100 KB", "img|compress|100")],
+               [P("⬅️ Back", "img|menu")]])
+
+
+def image_resolution_kb():
+    return KB([[G("Original size", "img|resize|0x0")],
+               [G("320 x 320", "img|resize|320x320"), G("640 x 640", "img|resize|640x640")],
+               [G("1024 x 1024", "img|resize|1024x1024")],
+               [P("✍️ Custom size", "img|custom"), P("⬅️ Back", "img|menu")]])
+
+
+async def show_image_tools(message):
+    uid = message.from_user.id
+    image_requests[uid] = {"message": message}
+    await message.reply(
+        "🖼️ **Photo Tools**\n\n"
+        "Thumbnail set karein, format badlein, file size kam karein, ya resolution resize karein.",
+        reply_markup=image_tools_kb())
+
+
+def load_image(source):
+    from PIL import Image, ImageOps
+
+    image = Image.open(source)
+    image = ImageOps.exif_transpose(image)
+    image.load()
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+    return image
+
+
+def resize_image(image, width, height):
+    from PIL import Image
+
+    resized = image.copy()
+    if width and height:
+        resized.thumbnail((width, height), Image.Resampling.LANCZOS)
+    return resized
+
+
+def _jpeg_ready(image):
+    from PIL import Image
+
+    if image.mode == "RGBA":
+        background = Image.new("RGB", image.size, "white")
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+    return image.convert("RGB")
+
+
+def convert_image(source, destination, image_format, width=None, height=None):
+    from PIL import Image
+
+    image = resize_image(load_image(source), width, height)
+    if image_format == "jpg":
+        image = _jpeg_ready(image)
+        image.save(destination, format="JPEG", quality=92, optimize=True, progressive=True)
+    elif image_format == "png":
+        image.save(destination, format="PNG", optimize=True)
+    elif image_format == "pdf":
+        _jpeg_ready(image).save(destination, format="PDF", resolution=150.0)
+    elif image_format == "svg":
+        import base64
+        import io
+
+        buffer = io.BytesIO()
+        mime = "image/png" if image.mode == "RGBA" else "image/jpeg"
+        if mime == "image/png":
+            image.save(buffer, format="PNG", optimize=True)
+        else:
+            _jpeg_ready(image).save(buffer, format="JPEG", quality=92, optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        width_px, height_px = image.size
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width_px}" height="{height_px}" '
+               f'viewBox="0 0 {width_px} {height_px}"><image width="{width_px}" '
+               f'height="{height_px}" href="data:{mime};base64,{encoded}"/></svg>')
+        Path(destination).write_text(svg, encoding="utf-8")
+    else:
+        raise ValueError("Unsupported image format.")
+    return image.size
+
+
+def compress_image(source, destination, max_bytes):
+    import io
+    from PIL import Image
+
+    image = _jpeg_ready(load_image(source))
+    while image.width >= 32 and image.height >= 32:
+        for quality in (85, 75, 65, 55, 45, 35, 25, 15):
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality, optimize=True, progressive=True)
+            if len(buffer.getvalue()) < max_bytes:
+                Path(destination).write_bytes(buffer.getvalue())
+                return image.size, len(buffer.getvalue())
+        next_size = (max(16, int(image.width * 0.85)), max(16, int(image.height * 0.85)))
+        if next_size == image.size:
+            break
+        image = image.resize(next_size, Image.Resampling.LANCZOS)
+    raise ValueError(f"Is photo ko requested {max_bytes // 1024} KB se chhota banana mumkin nahi hua.")
+
+
+def custom_image_resolution(text):
+    match = re.fullmatch(r"\s*(\d{1,5})\s*[xX×]\s*(\d{1,5})\s*", text)
+    if not match:
+        raise ValueError("Resolution `width x height` format me bhejein, jaise `1200x800`.")
+    width, height = map(int, match.groups())
+    if not 1 <= width <= 10000 or not 1 <= height <= 10000 or width * height > 40000000:
+        raise ValueError("Width/height 1–10000 aur total 40 megapixels se kam honi chahiye.")
+    return width, height
+
+
+def pdf_tools_kb():
+    return KB([[G("🧹 Remove Text Watermark", "pdf|remove")],
+               [G("➕ Add Watermark", "pdf|add")],
+               [P("📄 Keep Original", "pdf|keep")]])
+
+
+def _change_pdf_watermark(source, destination, action, text):
+    import pymupdf
+
+    document = pymupdf.open(source)
+    try:
+        if document.is_encrypted:
+            raise ValueError("Password-protected PDF supported nahi hai.")
+        if action == "add":
+            for page in document:
+                page.insert_text(
+                    pymupdf.Point(page.rect.width * 0.05, page.rect.height * 0.95),
+                    text[:80], fontsize=16, color=(0.45, 0.45, 0.45), overlay=True)
+        elif action == "remove":
+            matches = 0
+            for page in document:
+                rectangles = page.search_for(text)
+                for rectangle in rectangles:
+                    page.add_redact_annot(rectangle, fill=False, cross_out=False)
+                matches += len(rectangles)
+                if rectangles:
+                    page.apply_redactions(images=0, graphics=0)
+            if not matches:
+                raise ValueError(
+                    "PDF me is exact text ka watermark nahi mila. "
+                    "Scanned/flattened image watermark auto-remove nahi ho sakta.")
+        else:
+            raise ValueError("PDF watermark action valid nahi hai.")
+        document.save(destination, garbage=4, deflate=True)
+        return len(document)
+    finally:
+        document.close()
+
+
+async def pdf_watermark_job(c, uid, source_message, action, text, status):
+    work = WORK / uuid.uuid4().hex
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        name = clean_name(Path(source_message.document.file_name or "document.pdf").name)
+        source = await c.download_media(source_message, file_name=str(work / name))
+        if not source:
+            raise RuntimeError("PDF download nahi ho saka.")
+        suffix = "_watermarked.pdf" if action == "add" else "_watermark_removed.pdf"
+        output = work / f"{Path(name).stem}{suffix}"
+        pages = await asyncio.to_thread(_change_pdf_watermark, source, output, action, text)
+        await c.send_document(status.chat.id, str(output), caption=f"{output.name} · {pages} page(s)",
+                              **rkw(source_message.id))
+        await status.edit(f"✅ PDF ready: {output.name}")
+    except Exception as e:
+        logging.exception("PDF watermark processing failed for user %s", uid)
+        await status.edit(f"❌ PDF process nahi hui:\n`{str(e)[-400:]}`")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def image_action_job(c, uid, source_message, action, value, status):
+    work = WORK / uuid.uuid4().hex
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        filename = (source_message.document.file_name if source_message.document else None)
+        suffix = Path(filename or "").suffix.lower() or ".jpg"
+        source = await c.download_media(source_message, file_name=str(work / f"source{suffix}"))
+        if not source:
+            raise RuntimeError("Photo download nahi ho saka.")
+        output_dir = work / "out"
+        output_dir.mkdir()
+        if action == "convert":
+            output = output_dir / f"converted.{value}"
+            size = await asyncio.to_thread(convert_image, source, output, value)
+            detail = f"{size[0]} x {size[1]} pixels"
+        elif action == "compress":
+            target_kb = int(value)
+            output = output_dir / f"compressed_under_{target_kb}kb.jpg"
+            size, byte_count = await asyncio.to_thread(
+                compress_image, source, output, target_kb * 1024)
+            detail = f"{size[0]} x {size[1]} px · {byte_count / 1024:.1f} KB"
+        elif action == "resize":
+            width, height = value
+            output = output_dir / "resized.jpg"
+            size = await asyncio.to_thread(convert_image, source, output, "jpg", width, height)
+            detail = f"{size[0]} x {size[1]} pixels"
+        else:
+            raise ValueError("Photo action pehchaan nahi aaya.")
+        await c.send_document(
+            status.chat.id, str(output), caption=f"{output.name}\n{detail}",
+            **rkw(source_message.id))
+        await status.edit(f"✅ Photo ready: {output.name}\n{detail}")
+    except Exception as e:
+        logging.exception("Photo processing failed for user %s", uid)
+        await status.edit(f"❌ Photo process nahi hui:\n`{str(e)[-400:]}`")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 @app.on_message(filters.command("addthumb") & filters.private & allowed)
@@ -341,50 +625,110 @@ def start_kb():
 
 
 COMMANDS_TXT = (
-    "/start - Main menu\n\n"
-    "/settings - Upload as Video/File, Rename File ON/OFF\n\n"
-    "/addthumb - Apna thumbnail set karo (photo bhejo / photo par reply)\n\n"
-    "/delthumb - Thumbnail hatao (auto cover wapas)\n\n"
-    "/info - Apni info (Owner: /info @username). Account creation date Telegram nahi deta.\n\n"
-    "YouTube / Instagram video link bhejo - video download karke yahin milega\n\n"
-    "/bulk - Bahut saari videos / t.me links ki range ek saath process\n\n"
-    "/forward channel_id - Current bulk ke originals aur results additional channel me bhejo\n\n"
-    "/channelcopy - Accessible channel se media ko destination channel me copy karo\n\n"
-    "/extracturl - Direct link se ZIP / 7Z / RAR / TAR extract\n\n"
-    "/makearchive - Direct file link(s) se archive create\n\n"
-    "/merge - Videos merge karo\n\n"
-    "/done - Collection khatam, process shuru\n\n"
-    "/cancel - Current session cancel\n\n"
-    "/disclaimer - Legal disclaimer\n\n"
-    "**Owner only:**\n/grant - User ko access do\n\n/deny - Access hatao\n\n/users - Allowed users list")
+    "**📌 Basic Commands**\n\n"
+    "1. `/start` ya `/help` — Main menu, functions aur commands dekhein.\n"
+    "2. `/settings` — Upload mode (Video/File) aur Rename File set karein.\n"
+    "3. `/addthumb` — Apne videos ke liye custom thumbnail set karein.\n"
+    "4. `/delthumb` — Custom thumbnail hata kar automatic cover par lautain.\n"
+    "5. Photo bhejein — thumbnail, JPG/PNG/SVG/PDF conversion, size compression aur resize options kholein.\n"
+    "6. PDF bhejein — exact text watermark remove karne ki koshish karein, apna watermark add karein, ya original rakhein.\n"
+    "7. `/info` — Apni info dekhein; owner `/info @username` se kisi user ki info dekh sakta hai.\n"
+    "8. `/bulk` — Kai videos ya `t.me` message range ko ek saath process karein.\n"
+    "9. `/forward <channel_id>` — Bulk ke results ek additional channel me bhi bhejein.\n"
+    "10. `/done` — Bulk/merge ke liye file collection complete karke processing shuru karein.\n"
+    "11. `/merge` — Videos bhejein, phir `/done` se merge karein.\n"
+    "12. `/channelcopy` — Accessible source channel se media destination channel me copy karein.\n"
+    "13. `/copycancel` — Pending channel-copy setup cancel karein.\n"
+    "14. `/extracturl <URL>` — Direct link se ZIP, 7Z, RAR ya TAR archive extract karein.\n"
+    "15. `/makearchive <URL>` — Direct ya supported media link(s) ko archive me pack karein.\n"
+    "16. `/cancel` — Current file-processing session cancel karein.\n"
+    "17. `/filecompress` — Multiple files ko ZIP/7Z/RAR/TAR.GZ me compress karein.\n"
+    "18. `/fileextract` — ZIP/7Z/RAR/TAR file ya direct archive URL extract karein.\n"
+    "19. `/disclaimer` — Usage aur legal disclaimer dekhein.\n"
+    "20. Multiple media links ek message me bhejein — format choose karke archive download karein.\n"
+    "21. `/cancel` — Apne pending sessions aur active jobs stop karein.\n\n"
+    "**👑 Owner Commands**\n"
+    "22. `/stop` — Sab users ke active jobs stop karke pending sessions reset karein.\n"
+    "23. `/grant @username` — User ko bot access dein.\n"
+    "24. `/deny @username` — User ka bot access remove karein.\n"
+    "25. `/users` — Allowed users ki list dekhein.\n"
+    "26. `Other Bots` menu — Bot links add ya remove karein (owner only).")
 
 FUNCTIONS_TXT = (
-    "**🎬 Video Functions**\n\n"
-    "• 🖼️ Thumb/Cover Extractor, Screenshots, Manual Shots\n"
-    "• ✏️ Caption And Buttons Editor, Metadata Editor, Video Renamer\n"
-    "• 🎥 Stream Mapper / Remover / Extractor\n"
-    "• ✂️ Video Trimmer, Videos Splitter, Generate Sample, Video Merger\n"
-    "• 🔇 Remove Audio, Merge 🎥 And 🎵, Subtitle Merger\n"
-    "• 🎵 Video To Audio, Audio Converter\n"
-    "• 🗜 Video Optimizer, 🔄 Video Converter\n"
-    "• 📡 To M3U8 (HLS) with All Quality (parallel)\n"
-    "• ℹ️ Media Information, 📂 Create Archive\n"
-    "• 🖼 Custom Thumbnail (/addthumb), 💧 Moving Watermark\n"
-    "• 📦 Bulk: videos ya t.me link range, har video ka alag progress; originals/results permanent channel + optional /forward destination me\n"
-    "• 🌐 Direct URL se archive extract/create (ZIP, 7Z, RAR, TAR)\n"
-    "• 📥 YouTube / Instagram public video links download karke Telegram par bhejo\n"
-    "• Live Progress ⚡ button on every download / process / upload")
+    "**🎬 Video bhejne par available functions**\n\n"
+    "1. Thumbnail/cover extract, screenshots aur manual screenshots.\n"
+    "2. Caption aur buttons edit; video metadata edit aur file rename.\n"
+    "3. Video streams map, remove ya extract.\n"
+    "4. Video trim, split, sample generate ya multiple videos merge.\n"
+    "5. Video se audio remove; audio ya subtitles video ke saath merge.\n"
+    "6. Video ko audio formats me convert; audio format aur quality choose karein.\n"
+    "7. Video optimize/compress aur MP4, MKV, AVI, M4V ya Stream me convert.\n"
+    "8. M3U8/HLS me export — Original, 360p, 480p, 720p, 1080p ya all qualities.\n"
+    "9. Media information dekhein aur archive banayein.\n\n"
+    "**🌐 URL aur Bulk tools**\n"
+    "10. Direct URL se ZIP/7Z/RAR/TAR extract ya supported file/media URL(s) se archive create.\n"
+    "11. Public YouTube/Instagram video link bhej kar download karein.\n"
+    "12. `/bulk` se kai videos ya `t.me` video range process karein; `/done` par actions chunein.\n"
+    "13. Original aur processed files permanent channel me jaati hain; bulk ke liye `/forward` se extra channel set karein.\n\n"
+    "**⚙️ Personal settings**\n"
+    "14. `/settings` me Upload as Video/File aur Rename File set karein.\n"
+    "15. `/addthumb` se custom thumbnail set karein; `/delthumb` se remove karein.\n"
+    "16. `/filecompress` se multiple documents/media ko ZIP, 7Z, RAR ya TAR.GZ me pack karein.\n"
+    "17. `/fileextract` se Telegram archive ya direct archive URL extract karke files paayein.\n"
+    "18. Photo bhej kar usse thumbnail set, JPG/PNG/SVG/PDF convert, 20/50/100 KB se chhota compress, ya resize karein.\n"
+    "19. PDF bhej kar exact text watermark remove karne ki koshish, watermark add, ya original keep karein. Scanned watermark remove nahi hota.\n"
+    "20. `/cancel` se apne active jobs rokein; bot owner `/stop` se sab users ke jobs rokh sakta hai.\n"
+    "21. Har download, process aur upload par live progress available hai.")
 
 DISCLAIMER_TXT = (
-    "**⚠️ Legal Disclaimer**\n\n"
-    "Is bot ko sirf aisi files par use karo jinka aapke paas right/permission ho. "
-    "Copyrighted ya illegal content process karne ki zimmedari poori tarah user ki hai. "
-    "Bot owner kisi bhi misuse ke liye responsible nahi hai.")
+    "⚖️ **Legal Disclaimer**\n\n"
+    "MultiCodeX Video Bot provides media downloading, conversion, "
+    "file packaging, and related utility tools for publicly accessible content. "
+    "We do not claim ownership of third-party content.\n\n"
+    "• **User Responsibility:** You are responsible for ensuring that you have "
+    "the necessary rights or permission to download, convert, or process any file.\n\n"
+    "• **Copyright & Legal Compliance:** Using this bot to infringe copyright, "
+    "distribute unauthorized content, or engage in illegal activities is prohibited. "
+    "Users must comply with applicable laws and platform terms.\n\n"
+    "• **Privacy & Data Handling:** Data handling depends on the bot's actual "
+    "implementation. Do not submit sensitive or confidential information. "
+    "Refer to the applicable privacy policy for details.\n\n"
+    "• **File Security:** We cannot guarantee that files obtained or processed "
+    "through this bot are safe, accurate, or free from malware. Use the service "
+    "at your own risk.\n\n"
+    "• **Limitation of Liability:** To the extent permitted by applicable law, "
+    "the developers are not responsible for losses or consequences arising from "
+    "misuse of the bot or files processed through it.\n\n"
+    "• **Changes:** This disclaimer may be updated when necessary. Continued "
+    "use of the bot is subject to the applicable terms and laws.\n\n"
+    "📩 **Contact/Support:** @b2gpt")
 
 
 def nav_kb(cur):
     other = ("Commands", "s|cmds") if cur == "func" else ("Functions", "s|func")
     return KB([[P("Home", "s|home"), P(*other)], [R("Close", "s|close")]])
+
+
+async def other_bots_view(uid: int, notice=None):
+    bots = await get_other_bots()
+    rows = []
+    for bot in bots:
+        link = B(bot["name"][:30], url=bot["url"])
+        if uid == OWNER_ID:
+            rows.append([link, R("❌ Remove", f"sb|del|{bot['id']}")])
+        else:
+            rows.append([link])
+    if uid == OWNER_ID:
+        rows.append([G("➕ Add Bot", "sb|add")])
+    rows.extend([[P("Home", "s|home")], [R("Close", "s|close")]])
+    text = "**🤖 Other Bots**"
+    if notice:
+        text += f"\n\n{notice}"
+    if not bots:
+        text += "\n\nAbhi koi bot add nahi hai."
+    elif uid != OWNER_ID:
+        text += "\n\nNeeche kisi bot ko open karein."
+    return text, KB(rows)
 
 
 @app.on_message(filters.command(["start", "help"]) & filters.private)
@@ -415,21 +759,49 @@ async def start_cb(c, q):
         return await q.message.edit(
             "🌐 **Direct Link Archive Tools**\n\n"
             "Archive extract: `/extracturl` then direct ZIP / 7Z / RAR / TAR URL.\n"
-            "Archive create: `/makearchive` then one or more direct file URLs.",
+            "Archive create: `/makearchive` then one or more direct file or supported media URLs.",
             reply_markup=KB([[G("📥 Extract Archive", "a|url_extract")],
                              [G("📦 Create Archive", "a|url_create")],
                              [P("Home", "s|home"), R("Close", "s|close")]]))
     if k == "disc":
         return await q.message.edit(DISCLAIMER_TXT, reply_markup=nav_kb("cmds"))
     if k == "bots":
-        rows = []
-        for part in filter(None, (x.strip() for x in OTHER_BOTS.split(","))):
-            if "|" in part:
-                n, u = part.split("|", 1)
-                rows.append([B(n.strip(), url=u.strip())])
-        rows += [[P("Home", "s|home")], [R("Close", "s|close")]]
-        txt = "**🤖 Other Bots**" if len(rows) > 2 else "Abhi koi aur bot add nahi hai.\n(`OTHER_BOTS` env me add kar sakte ho.)"
-        return await q.message.edit(txt, reply_markup=KB(rows))
+        try:
+            text, keyboard = await other_bots_view(q.from_user.id)
+        except Exception:
+            logging.exception("Failed to load other bot links")
+            return await q.message.edit("❌ Other Bots list load nahi hui. Storage connection check karein.")
+        return await q.message.edit(text, reply_markup=keyboard)
+
+
+@app.on_callback_query(filters.regex(r"^sb\|") & owner)
+async def other_bots_admin_cb(c, q):
+    parts = q.data.split("|", 2)
+    await q.answer()
+    if parts[1] == "add":
+        bot_admin_wait.add(q.from_user.id)
+        return await q.message.edit(
+            "➕ Bot ka naam aur Telegram link bhejein:\n"
+            "`Bot Name | https://t.me/botusername`\n\n"
+            "Ya `Bot Name | @botusername` bhejein. Cancel: /cancel",
+            reply_markup=KB([[R("Cancel", "sb|cancel")]]))
+    if parts[1] == "cancel":
+        bot_admin_wait.discard(q.from_user.id)
+        text, keyboard = await other_bots_view(q.from_user.id)
+        return await q.message.edit(text, reply_markup=keyboard)
+    if parts[1] == "del" and len(parts) == 3:
+        try:
+            bots = await get_other_bots()
+            updated = [bot for bot in bots if bot["id"] != parts[2]]
+            if len(updated) == len(bots):
+                text, keyboard = await other_bots_view(q.from_user.id, "Ye bot pehle hi remove ho chuka hai.")
+            else:
+                await save_other_bots(updated)
+                text, keyboard = await other_bots_view(q.from_user.id, "✅ Bot remove ho gaya.")
+        except Exception:
+            logging.exception("Failed to remove an other bot link")
+            return await q.message.edit("❌ Bot remove nahi hua. Storage connection check karein.")
+        return await q.message.edit(text, reply_markup=keyboard)
 
 # ---------------------------------------------------------------- /settings
 def settings_text(uid):
@@ -487,25 +859,35 @@ async def ff(*args):
     job.procs.add(p)
     idx = CUR_IDX.get()
     err_task = asyncio.create_task(p.stderr.read())  # drain stderr so ffmpeg never blocks
-    while True:
-        line = await p.stdout.readline()
-        if not line:
-            break
-        line = line.decode(errors="ignore").strip()
-        if line.startswith(("out_time_us=", "out_time_ms=")):  # both are microseconds
-            try:
-                us = int(line.split("=", 1)[1])
-            except ValueError:
-                continue
-            if us > 0 and job.stage == "convert":
-                if idx is None:
-                    job.cur = min(us / 1e6, job.total) if job.total else us / 1e6
-                else:  # parallel tasks: sum of every task's progress
-                    job.cparts[idx] = us / 1e6
-                    job.cur = min(sum(job.cparts.values()), job.total) if job.total else sum(job.cparts.values())
-    await p.wait()
-    err = (await err_task).decode(errors="ignore")
-    job.procs.discard(p)
+    try:
+        while True:
+            line = await p.stdout.readline()
+            if not line:
+                break
+            line = line.decode(errors="ignore").strip()
+            if line.startswith(("out_time_us=", "out_time_ms=")):  # both are microseconds
+                try:
+                    us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                if us > 0 and job.stage == "convert":
+                    if idx is None:
+                        job.cur = min(us / 1e6, job.total) if job.total else us / 1e6
+                    else:  # parallel tasks: sum of every task's progress
+                        job.cparts[idx] = us / 1e6
+                        job.cur = min(sum(job.cparts.values()), job.total) if job.total else sum(job.cparts.values())
+        await p.wait()
+        err = (await err_task).decode(errors="ignore")
+    except asyncio.CancelledError:
+        if p.returncode is None:
+            p.kill()
+        await p.wait()
+        if not err_task.done():
+            err_task.cancel()
+        await asyncio.gather(err_task, return_exceptions=True)
+        raise
+    finally:
+        job.procs.discard(p)
     chk(job)
     if p.returncode:
         raise RuntimeError(err[-600:])
@@ -633,6 +1015,39 @@ class Job:
                     pass
 
 
+def start_operation(coro, uid=None, status=None):
+    async def run():
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            if status:
+                try:
+                    await status.edit("🛑 Operation stopped.", reply_markup=None)
+                except Exception:
+                    logging.debug("Could not update stopped operation status")
+            raise
+
+    task = asyncio.create_task(run())
+    operation_tasks[task] = (uid, status)
+    task.add_done_callback(operation_tasks.pop)
+    return task
+
+
+async def cancel_operations(uid=None):
+    current = asyncio.current_task()
+    matching_jobs = [job for job in list(jobs.values())
+                     if uid is None or job.uid == uid]
+    for job in matching_jobs:
+        job.cancel()
+    tasks = [task for task, (task_uid, _) in list(operation_tasks.items())
+             if task is not current and (uid is None or task_uid == uid)]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return len(tasks), len(matching_jobs)
+
+
 def chk(job):
     if job and job.cancelled:
         raise Cancelled()
@@ -648,6 +1063,10 @@ STAGE_TXT = {
 
 def job_kb(job):
     return KB([[G("Progress ⚡", f"pg|{job.id}"), R("Cancel ❌", f"cx|{job.id}")]])
+
+
+def stop_scan_kb():
+    return KB([[R("🛑 Cancel All My Jobs", "op|cancel")]])
 
 
 async def set_stage(job, stage, label=""):
@@ -1067,7 +1486,7 @@ async def act_zip(src, out, p):
 
 
 def direct_urls(text):
-    urls = [line.strip().strip("<>") for line in text.splitlines() if line.strip()]
+    urls = extract_http_urls(text)
     if not urls or len(urls) > 20:
         raise ValueError("1 se 20 direct URLs bhejo (har URL alag line me).")
     for url in urls:
@@ -1114,6 +1533,11 @@ def _download_direct(url, destination, job):
             filename = unquote(filename)
         else:
             filename = Path(unquote(urlsplit(response.geturl()).path)).name
+        if not Path(filename or "").suffix:
+            content_type = response.headers.get_content_type()
+            extension = mimetypes.guess_extension(content_type)
+            if extension and extension != ".bin":
+                filename = f"{filename or 'downloaded_file'}{extension}"
         filename = clean_name(Path(filename or "").name) or "downloaded_file"
         target = destination / filename
         if not target.suffix:
@@ -1364,27 +1788,40 @@ def archive_format_kb():
                [P("Cancel", "ar|cancel")]])
 
 
+def url_bundle_format_kb():
+    return KB([[G("📦 ZIP", "ub|zip"), G("🗜 7Z", "ub|7z")],
+               [G("📁 RAR", "ub|rar"), G("🗂 TAR.GZ", "ub|tar.gz")],
+               [R("Cancel", "ub|cancel")]])
+
+
 async def archive_url_job(c, uid, chat, urls, mode, archive_format, status):
     d = WORK / uuid.uuid4().hex
     job = Job(uid, status)
     progress_task = asyncio.create_task(progress_watch(job))
     try:
-        if mode == "extract" and len(urls) != 1:
-            raise RuntimeError("Ek baar me ek archive URL bhejo.")
+        if mode in ("extract", "auto") and len(urls) != 1:
+            raise RuntimeError("Ek baar me ek direct file/archive URL bhejo.")
         downloaded = []
         for i, url in enumerate(urls, 1):
             await set_stage(job, "download", f"Direct link {i}/{len(urls)}")
-            downloaded.append(await download_direct(url, d / f"in{i:03d}", job))
+            if mode == "create":
+                downloaded.append(
+                    await download_url_for_archive(url, d / f"in{i:03d}", job))
+            else:
+                downloaded.append(await download_direct(url, d / f"in{i:03d}", job))
         out = d / "out"
         out.mkdir(parents=True, exist_ok=True)
-        if mode == "extract":
+        if mode == "auto" and not _archive_type(downloaded[0]):
+            await set_stage(job, "upload", downloaded[0].name)
+            await send_out(c, chat, downloaded[0], job=job, uid=uid, reply_to=status.id)
+        elif mode in ("extract", "auto"):
             await set_stage(job, "convert", "Archive extract ho raha hai")
             extracted = await asyncio.to_thread(_extract_archive, downloaded[0], out)
             for i, path in enumerate(extracted, 1):
                 chk(job)
                 await set_stage(job, "upload", f"Extracted file {i}/{len(extracted)}")
-                await c.send_document(chat, str(path), caption=path.name,
-                                      progress=prog_cb(job, i), **rkw(status.id))
+                await send_out(c, chat, path, cap=path.name, job=job, idx=i, uid=uid,
+                               reply_to=status.id)
         else:
             await set_stage(job, "convert", f"{archive_format.upper()} archive ban raha hai")
             job.total = sum(path.stat().st_size for path in downloaded)
@@ -1394,7 +1831,12 @@ async def archive_url_job(c, uid, chat, urls, mode, archive_format, status):
             await c.send_document(chat, str(archive), caption=archive.name,
                                   progress=prog_cb(job), **rkw(status.id))
         await stop_progress_watch(progress_task)
-        await status.edit(f"✅ {('Extraction' if mode == 'extract' else 'Archive creation')} complete.")
+        label = "Extraction" if mode in ("extract", "auto") and _archive_type(downloaded[0]) else (
+            "Download" if mode == "auto" else "Archive creation")
+        await status.edit(f"✅ {label} complete.")
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
     except Exception as e:
         await fail(status, job, e)
     finally:
@@ -1403,10 +1845,133 @@ async def archive_url_job(c, uid, chat, urls, mode, archive_format, status):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def telegram_file_name(message):
+    for media in ("document", "video", "audio", "animation", "voice", "video_note", "sticker"):
+        item = getattr(message, media, None)
+        if item:
+            name = getattr(item, "file_name", None)
+            if name:
+                return clean_name(Path(name).name) or "file.bin"
+            if media == "photo":
+                return f"{item.file_unique_id}.jpg"
+            ext = {"voice": ".ogg", "video_note": ".mp4", "sticker": ".webp",
+                   "animation": ".mp4"}.get(media, "")
+            return f"{getattr(item, 'file_unique_id', uuid.uuid4().hex)}{ext or '.bin'}"
+    if message.photo:
+        return f"{message.photo.file_unique_id}.jpg"
+    return "file.bin"
+
+
+def file_compress_format_kb():
+    return KB([[G("📦 ZIP", "fc|zip"), G("🗜 7Z", "fc|7z")],
+               [G("📁 RAR", "fc|rar"), G("🗂 TAR.GZ", "fc|tar.gz")],
+               [R("Cancel ❌", "fc|cancel")]])
+
+
+async def file_compress_job(c, uid, chat, messages, archive_format, status):
+    d = WORK / uuid.uuid4().hex
+    job = Job(uid, status)
+    progress_task = asyncio.create_task(progress_watch(job))
+    try:
+        input_dir = d / "in"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        downloaded = []
+        used_names = set()
+        for index, message in enumerate(messages, 1):
+            name = telegram_file_name(message)
+            if name.casefold() in used_names:
+                name = f"{index}_{name}"
+            used_names.add(name.casefold())
+            await set_stage(job, "download", f"Telegram file {index}/{len(messages)}")
+            path = await c.download_media(
+                message, file_name=str(input_dir / name), progress=prog_cb(job, index))
+            if not path:
+                raise RuntimeError(f"Telegram file download nahi hui: {name}")
+            downloaded.append(Path(path))
+        job.total = sum(path.stat().st_size for path in downloaded)
+        await set_stage(job, "convert", f"{archive_format.upper()} archive ban raha hai")
+        archive = await asyncio.to_thread(_create_archive, downloaded, d / "out", archive_format)
+        chk(job)
+        await set_stage(job, "upload", archive.name)
+        await send_out(c, chat, archive, job=job, uid=uid, reply_to=status.id)
+        await status.edit("✅ File compression complete.")
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
+    except Exception as e:
+        await fail(status, job, e)
+    finally:
+        await stop_progress_watch(progress_task)
+        jobs.pop(job.id, None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def telegram_archive_extract_job(c, uid, chat, message, status):
+    d = WORK / uuid.uuid4().hex
+    job = Job(uid, status)
+    progress_task = asyncio.create_task(progress_watch(job))
+    try:
+        input_dir = d / "in"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        name = telegram_file_name(message)
+        await set_stage(job, "download", name)
+        path = await c.download_media(
+            message, file_name=str(input_dir / name), progress=prog_cb(job))
+        if not path:
+            raise RuntimeError("Archive Telegram se download nahi hui.")
+        out = d / "out"
+        await set_stage(job, "convert", "Archive extract ho raha hai")
+        extracted = await asyncio.to_thread(_extract_archive, Path(path), out)
+        for index, file_path in enumerate(extracted, 1):
+            chk(job)
+            await set_stage(job, "upload", f"Extracted file {index}/{len(extracted)}")
+            await send_out(c, chat, file_path, cap=file_path.name, job=job, idx=index,
+                           uid=uid, reply_to=status.id)
+        await status.edit(f"✅ Extraction complete. {len(extracted)} file(s) bheji.")
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
+    except Exception as e:
+        await fail(status, job, e)
+    finally:
+        await stop_progress_watch(progress_task)
+        jobs.pop(job.id, None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def handle_file_utility_media(c, message):
+    uid = message.from_user.id
+    session = sessions.get(uid)
+    if not session:
+        return False
+    if session.get("mode") in ("filecompress", "filecompress_select"):
+        messages = session.setdefault("files", [])
+        if message.id in session.setdefault("file_message_ids", set()):
+            return True
+        session["file_message_ids"].add(message.id)
+        messages.append(message)
+        await message.reply(f"✅ File added #{len(messages)}. Aur bhejo ya /done karein.")
+        return True
+    if session.get("wait") != "fileextract":
+        return False
+    seen = session.setdefault("file_message_ids", set())
+    if message.id in seen:
+        return True
+    seen.add(message.id)
+    if not message.document or not _archive_type(Path(telegram_file_name(message))):
+        await message.reply("❌ ZIP, 7Z, RAR ya TAR archive upload karein. Ya direct archive URL bhejein.")
+        return True
+    sessions.pop(uid, None)
+    status = await message.reply("📥 Archive extract ho raha hai...")
+    start_operation(telegram_archive_extract_job(c, uid, message.chat.id, message, status),
+                    uid=uid, status=status)
+    return True
+
+
 SOCIAL_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
     "instagram.com", "www.instagram.com", "instagr.am",
-    "drive.google.com", "docs.google.com",
+    "drive.google.com", "drive.usercontent.google.com", "docs.google.com",
     "terabox.com", "www.terabox.com", "1024terabox.com", "www.1024terabox.com",
     "teraboxapp.com", "www.teraboxapp.com", "terabox.app", "www.terabox.app",
     "teraboxlink.com", "www.teraboxlink.com", "1024tera.com",
@@ -1418,6 +1983,12 @@ SOCIAL_HOSTS = {
 SOCIAL_MEDIA_EXTS = {
     ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".flv",
     ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wav",
+}
+DIRECT_FILE_EXTS = SOCIAL_MEDIA_EXTS | {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff",
+    ".pdf", ".txt", ".csv", ".json", ".xml", ".html",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz",
 }
 YOUTUBE_CHOICES = {
     "best": "bestvideo*+bestaudio/best",
@@ -1431,18 +2002,26 @@ YOUTUBE_CHOICES = {
 }
 
 
-def social_video_url(text):
+def extract_http_urls(text):
+    urls = []
     for match in re.finditer(r"https?://[^\s<>]+", text, re.IGNORECASE):
-        candidate = match.group(0).rstrip(".,!?;:)]}")
-        try:
-            parsed = urlsplit(candidate)
-            host = (parsed.hostname or "").lower().rstrip(".")
-        except ValueError:
-            continue
-        if (parsed.scheme.lower() == "https" and host in SOCIAL_HOSTS and
-                parsed.path not in ("", "/") and not parsed.username and not parsed.password):
-            return candidate
-    return None
+        url = match.group(0).rstrip(".,!?;:)]}")
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def direct_file_url(text):
+    match = re.fullmatch(r"\s*(https?://[^\s<>]+)\s*", text, re.IGNORECASE)
+    if not match:
+        return None
+    candidate = match.group(1).rstrip(".,!?;:)]}")
+    try:
+        parsed = urlsplit(candidate)
+        extension = Path(unquote(parsed.path)).suffix.lower()
+    except ValueError:
+        return None
+    return candidate if extension in DIRECT_FILE_EXTS else None
 
 
 def youtube_quality_kb():
@@ -1551,6 +2130,39 @@ def _download_social_video(url, destination, job, choice="best"):
     return path, info.get("title") or path.name
 
 
+def youtube_download_hint(url, error, choice="best"):
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    detail = str(error)
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
+        if any(text in detail.lower() for text in (
+                "sign in to confirm", "not a bot", "confirm you're not a bot",
+                "cookies-from-browser", "login required")):
+            return RuntimeError(
+                "YouTube ne server ko sign-in/anti-bot check par rok diya. "
+                "Owner ko apne YouTube account se Netscape cookies export karke server par "
+                "securely rakhni hongi, phir YTDLP_COOKIES me us file ka path set karke bot restart karein. "
+                "Cookies kisi aur ko share na karein. YouTube access phir bhi guaranteed nahi hai.")
+        if choice == "mp3" and any(text in detail.lower() for text in (
+                "ffmpeg", "ffprobe", "postprocessing")):
+            return RuntimeError(
+                "MP3 conversion fail hui: server par FFmpeg install karke PATH me add karein, "
+                "phir bot restart karein.")
+    return error
+
+
+async def download_url_for_archive(url, destination, job):
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "drive.usercontent.google.com":
+        return await download_direct(url, destination, job)
+    if host in SOCIAL_HOSTS:
+        try:
+            path, _ = await asyncio.to_thread(_download_social_video, url, destination, job)
+            return path
+        except Exception as e:
+            raise youtube_download_hint(url, e) from e
+    return await download_direct(url, destination, job)
+
+
 async def social_video_job(c, uid, chat, url, source_message, choice="best", status=None):
     d = WORK / uuid.uuid4().hex
     status = status or await source_message.reply("⏳ Link se media download starting...")
@@ -1582,8 +2194,11 @@ async def social_video_job(c, uid, chat, url, source_message, choice="best", sta
                               "\n".join(channel_errors), reply_markup=None)
         else:
             await status.delete()
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
     except Exception as e:
-        await fail(status, job, e)
+        await fail(status, job, youtube_download_hint(url, e, choice))
     finally:
         await stop_progress_watch(progress_task)
         jobs.pop(job.id, None)
@@ -1595,7 +2210,7 @@ async def request_archive_urls(c, m, mode, text=None):
     s = sessions.setdefault(uid, {})
     s["wait"] = "archive_extract_urls" if mode == "extract" else "archive_create_urls"
     prompt = ("📥 Archive ka direct URL bhejo (ZIP / 7Z / RAR / TAR)." if mode == "extract"
-              else "📦 Ek ya multiple direct file URLs bhejo (har URL alag line par).")
+              else "📦 Ek ya multiple direct file/media URLs bhejo (har URL alag line par).")
     if text:
         try:
             urls = direct_urls(text)
@@ -1604,7 +2219,9 @@ async def request_archive_urls(c, m, mode, text=None):
         s["wait"] = None
         if mode == "extract":
             status = await m.reply("⏳ Archive extraction starting...")
-            return asyncio.create_task(archive_url_job(c, uid, m.chat.id, urls, mode, None, status))
+            return start_operation(
+                archive_url_job(c, uid, m.chat.id, urls, mode, None, status),
+                uid=uid, status=status)
         s["archive_urls"] = urls
         return await m.reply("Archive format choose karo:", reply_markup=archive_format_kb())
     await m.reply(prompt + "\n\nCancel: /cancel")
@@ -1930,6 +2547,9 @@ async def single_job(c, chat, msg, p: dict, status, local=None, uid=None, tag=""
         else:
             await status.delete()
         return not archive_errors
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
     except Exception as e:
         await fail(status, job, e)
         return False
@@ -1956,6 +2576,10 @@ async def prefetch(c, uid, chat, msg, status, kind):
         s["local"], s["streams"] = (src, d), streams
         s["pick"] = {"kind": kind, "streams": streams, "sel": []}
         await status.edit(pick_text(s["pick"]), reply_markup=pick_kb(s["pick"]))
+    except asyncio.CancelledError:
+        shutil.rmtree(d, ignore_errors=True)
+        await fail(status, job, Cancelled())
+        raise
     except Exception as e:
         shutil.rmtree(d, ignore_errors=True)
         await fail(status, job, e)
@@ -2021,6 +2645,9 @@ async def merge_job(c, chat, msgs, status, uid=None, forward_chat=None):
             await status.edit("✅ Merge complete", reply_markup=None)
         else:
             await status.delete()
+    except asyncio.CancelledError:
+        await fail(status, job, Cancelled())
+        raise
     except Exception as e:
         await fail(status, job, e)
     finally:
@@ -2075,7 +2702,7 @@ async def launch_bulk(c, uid, chat, p, status=None):
         await asyncio.gather(*[one(i + 1, m_) for i, m_ in enumerate(files)])
         await upd(done=True)
 
-    asyncio.create_task(runall())
+    start_operation(runall(), uid=uid, status=head)
 
 
 async def resolve_forward_channel(c, target):
@@ -2114,7 +2741,8 @@ async def launch(c, uid, chat, p, status=None):
         return await (status.edit(txt, reply_markup=back_kb()) if status else c.send_message(chat, txt))
     if status is None:
         status = await c.send_message(chat, "Starting...")
-    asyncio.create_task(single_job(c, chat, msg, p, status, s.pop("local", None), uid=uid))
+    start_operation(single_job(c, chat, msg, p, status, s.pop("local", None), uid=uid),
+                    uid=uid, status=status)
 
 # ---------------------------------------------------------------- UI
 def menu_text(uid):
@@ -2224,6 +2852,19 @@ video_filter = filters.create(lambda _, __, m: is_video(m))
 LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{4,}))/(?:\d+/)?(\d+)")
 
 
+def channel_access_hint(error):
+    detail = str(error)
+    if "USER_NOT_PARTICIPANT" in detail or error.__class__.__name__ == "UserNotParticipant":
+        return ("Telegram `USER_NOT_PARTICIPANT`: bot account itself is not a member of the "
+                "source channel. Add this bot to that channel, then retry.")
+    return detail
+
+
+def channel_access_hint_text():
+    return ("Private source channel ke liye aapka personal account join hona enough nahi hai. "
+            "Bot account ko bhi source me add karke messages dekhne ki access dein.")
+
+
 def parse_links(txt):
     out = []
     for m in LINK_RE.finditer(txt or ""):
@@ -2258,7 +2899,7 @@ async def add_links(m, s, links):
     await m.reply("✅ Start link mil gaya. Ab **end link** bhejo (ya /done = sirf yahi ek message).")
 
 
-async def fetch_range(c, chat, a, b):
+async def fetch_range(c, chat, a, b, progress=None):
     """Videos between message ids a..b. Text / photos / other files are skipped."""
     vids, skipped = [], 0
     ids = list(range(a, b + 1))
@@ -2271,7 +2912,66 @@ async def fetch_range(c, chat, a, b):
                 vids.append(x)
             else:
                 skipped += 1
+        if progress:
+            await progress(min(i + 100, len(ids)), len(ids), len(vids), skipped)
     return vids, skipped
+
+
+async def resolve_bulk_ranges(c, uid, chat, session, status):
+    ranges = session.get("ranges", [])
+    total_messages = sum(b - a + 1 for _, a, b in ranges)
+    scanned = found = skipped = 0
+    errors = []
+
+    for range_index, (source, first, last) in enumerate(ranges, 1):
+        range_found = 0
+
+        async def update(processed, range_total, videos, range_skipped):
+            nonlocal range_found
+            range_found = videos
+            text = (f"🔎 Counting videos: range {range_index}/{len(ranges)}\n"
+                    f"Messages checked: {scanned + processed}/{total_messages}\n"
+                    f"Videos found: {found + range_found}\n"
+                    f"Skipped: {skipped + range_skipped}")
+            try:
+                await status.edit(text, reply_markup=stop_scan_kb())
+            except Exception as error:
+                logging.debug("Bulk scan progress update failed: %s", error)
+
+        try:
+            videos, range_skipped = await fetch_range(c, source, first, last, update)
+            session.setdefault("files", []).extend(videos)
+            found += len(videos)
+            skipped += range_skipped
+        except Exception as error:
+            errors.append(f"{source}: {channel_access_hint(error)}")
+        finally:
+            scanned += last - first + 1
+
+    session["ranges"] = []
+    if sessions.get(uid) is not session:
+        return
+    if not session.get("files"):
+        text = "❌ Koi video nahi mila." + ("\n" + "\n".join(errors) if errors else "")
+        if any("USER_NOT_PARTICIPANT" in error for error in errors):
+            text += "\n\n" + channel_access_hint_text()
+        sessions.pop(uid, None)
+        return await status.edit(text, reply_markup=None)
+
+    files = session.pop("files")
+    session.pop("mode", None)
+    session["bulkfiles"], session["single"] = files, files[0]
+    note = f"✅ {len(files)} videos mil gayi"
+    if session.get("forward_chat"):
+        note += f"\n📤 Extra channel: `{session['forward_chat']}`"
+    if skipped:
+        note += f"  ({skipped} text/file/non-video skip)"
+    if errors:
+        note += "\n⚠️ " + "\n⚠️ ".join(errors)
+        if any("USER_NOT_PARTICIPANT" in error for error in errors):
+            note += "\n\n" + channel_access_hint_text()
+    text, keyboard = menu_view(uid, session)
+    await status.edit(note + "\n\n" + text, reply_markup=keyboard)
 
 
 def has_copyable_media(message):
@@ -2350,7 +3050,7 @@ async def run_channel_copy(c, source, start_id, end_id, destination, status):
     except Exception as e:
         logging.exception("Channel-copy job failed")
         try:
-            await status.edit(f"❌ Channel copy stopped:\n`{str(e)[-400:]}`")
+            await status.edit(f"❌ Channel copy stopped:\n`{channel_access_hint(e)[-400:]}`")
         except Exception:
             logging.exception("Could not report channel-copy job failure")
 
@@ -2362,7 +3062,7 @@ async def channelcopy_cmd(c, m):
         "📦 **Channel media copy**\n\n"
         "Start aur end message link bhejo (ek message me dono ya alag-alag):\n"
         "`https://t.me/channel/119` `https://t.me/channel/220`\n\n"
-        "Private source ke liye bot ko pehle channel me add karein; bot khud join nahi karega. "
+        "Private source ke liye bot account ko channel me add karein (aapka personal account join hona enough nahi hai); bot khud join nahi karega. "
         "Phir destination channel ID / `@username` bhejein. Bot destination me admin hona chahiye.\n"
         f"Ek range max {MAX_RANGE} messages hai. Deleted/non-media/protected messages skip honge; "
         f"copies ke beech kam se kam {CHANNEL_COPY_GAP:g}s gap rahega.\n"
@@ -2374,6 +3074,12 @@ async def channelcopy_cancel_cmd(c, m):
     if channel_copy_requests.pop(m.from_user.id, None) is None:
         return await m.reply("Koi channel-copy setup pending nahi hai.")
     await m.reply("Pending channel-copy setup cancel ho gaya. Running/queued copy ko ye command stop nahi karta.")
+
+
+@app.on_message(filters.private & allowed & filters.media, group=-1)
+async def file_utility_media_handler(c, m):
+    if await handle_file_utility_media(c, m):
+        raise StopPropagation
 
 
 @app.on_message(filters.private & allowed & (filters.video | filters.document) & video_filter)
@@ -2394,7 +3100,7 @@ async def on_photo(c, m):
     if s.get("wait") == "addthumb":
         s["wait"] = None
         return await save_thumb_safe(c, m, m)
-    await m.reply("Photo ko thumbnail banane ke liye pehle /addthumb bhejo.")
+    await show_image_tools(m)
 
 
 @app.on_message(filters.private & allowed & (filters.audio | filters.voice | filters.document))
@@ -2407,6 +3113,17 @@ async def on_extra(c, m):
             return await m.reply("❌ Photo bhejo (jpg / png).")
         sessions[uid]["wait"] = None
         return await save_thumb_safe(c, m, m)
+    if is_img(m) and w not in ("mux", "sub"):
+        return await show_image_tools(m)
+    if (m.document and
+            ((m.document.mime_type or "").lower() == "application/pdf"
+             or (m.document.file_name or "").lower().endswith(".pdf"))
+            and w not in ("mux", "sub")):
+        pdf_requests[uid] = {"message": m}
+        return await m.reply(
+            "📄 **PDF Watermark Options**\n\n"
+            "Remove text watermark, add your own text, ya original PDF bina change rakhein.",
+            reply_markup=pdf_tools_kb())
     if w not in ("mux", "sub"):
         return await m.reply("Pehle video bhejo, phir action choose karo.")
     if w == "sub":
@@ -2468,18 +3185,102 @@ async def archive_url_cmd(c, m):
     return await request_archive_urls(c, m, mode, text)
 
 
+@app.on_message(filters.private & allowed & filters.command("filecompress"))
+async def filecompress_cmd(c, m):
+    drop_local(sessions.setdefault(m.from_user.id, {}))
+    sessions[m.from_user.id] = {"mode": "filecompress", "files": [], "file_message_ids": set()}
+    await m.reply(
+        "📦 **File Compress Mode ON**\n\n"
+        "Photos, videos, audio, PDFs aur documents bhejein. "
+        "Sab files bhejne ke baad /done karein, phir archive format chunein.\n"
+        "Cancel: /cancel")
+
+
+@app.on_message(filters.private & allowed & filters.command("fileextract"))
+async def fileextract_cmd(c, m):
+    drop_local(sessions.setdefault(m.from_user.id, {}))
+    if len(m.command) > 1:
+        sessions.pop(m.from_user.id, None)
+        try:
+            urls = direct_urls(m.text.split(None, 1)[1])
+        except (ValueError, OSError) as e:
+            return await m.reply(f"❌ {e}")
+        if len(urls) != 1:
+            return await m.reply("❌ Ek baar me ek archive URL bhejein.")
+        status = await m.reply("📥 Archive extraction starting...")
+        return start_operation(
+            archive_url_job(c, m.from_user.id, m.chat.id, urls, "extract", None, status),
+            uid=m.from_user.id, status=status)
+    sessions[m.from_user.id] = {"wait": "fileextract", "file_message_ids": set()}
+    await m.reply(
+        "📥 **File Extract Mode ON**\n\n"
+        "ZIP, 7Z, RAR ya TAR archive upload karein, ya direct archive URL bhejein.\n"
+        "Cancel: /cancel")
+
+
+@app.on_callback_query(filters.regex(r"^fc\|") & allowed)
+async def filecompress_cb(c, q):
+    uid = q.from_user.id
+    choice = q.data.split("|", 1)[1]
+    await q.answer()
+    if choice == "cancel":
+        sessions.pop(uid, None)
+        return await q.message.edit("File compression cancelled.")
+    session = sessions.get(uid)
+    if not session or session.get("mode") != "filecompress_select":
+        return await q.message.edit("File compression session expire ho gaya. `/filecompress` dobara chalao.")
+    messages = session.get("files", [])
+    if not messages:
+        sessions.pop(uid, None)
+        return await q.message.edit("Koi file select nahi thi. `/filecompress` dobara chalao.")
+    sessions.pop(uid, None)
+    await q.message.edit(f"⏳ {len(messages)} file(s) ko {choice.upper()} me compress kar raha hoon...")
+    start_operation(file_compress_job(c, uid, q.message.chat.id, messages, choice, q.message),
+                    uid=uid, status=q.message)
+
+
 @app.on_message(filters.private & allowed & filters.command("cancel"))
 async def cancel_cmd(c, m):
-    social_requests.pop(m.from_user.id, None)
-    drop_local(sessions.get(m.from_user.id, {}))
-    sessions.pop(m.from_user.id, None)
-    await m.reply("Cancelled ✅")
+    uid = m.from_user.id
+    task_count, job_count = await cancel_operations(uid)
+    clear_user_interactions(uid)
+    await m.reply(f"Cancelled ✅ ({job_count} job(s), {task_count} task(s) stopped)")
+
+
+def clear_user_interactions(uid):
+    social_requests.pop(uid, None)
+    url_bundle_requests.pop(uid, None)
+    image_requests.pop(uid, None)
+    pdf_requests.pop(uid, None)
+    channel_copy_requests.pop(uid, None)
+    bot_admin_wait.discard(uid)
+    drop_local(sessions.pop(uid, {}))
+
+
+@app.on_message(filters.private & owner & filters.command("stop"))
+async def stop_all_cmd(c, m):
+    operation_count, job_count = await cancel_operations()
+    for uid in list(sessions):
+        clear_user_interactions(uid)
+    for requests in (social_requests, url_bundle_requests, image_requests,
+                     pdf_requests, channel_copy_requests):
+        requests.clear()
+    bot_admin_wait.clear()
+    await m.reply(
+        "🛑 **Global stop complete.**\n"
+        f"Stopped {job_count} job(s) and {operation_count} task(s), then reset pending sessions.\n"
+        "Already delivered Telegram files/messages cannot be recalled.")
 
 
 @app.on_message(filters.private & allowed & filters.command("done"))
 async def done_cmd(c, m):
     uid = m.from_user.id
     s = sessions.get(uid)
+    if s and s.get("mode") in ("filecompress", "filecompress_select"):
+        if not s.get("files"):
+            return await m.reply("Pehle compress karne ke liye files bhejein.")
+        s["mode"] = "filecompress_select"
+        return await m.reply("📦 Archive format choose karein:", reply_markup=file_compress_format_kb())
     if not s or s.get("mode") not in ("bulk", "merge") or not (s.get("files") or s.get("ranges") or s.get("pend")):
         return await m.reply("Pehle /bulk ya /merge chalao aur files / links bhejo.")
     if s["mode"] == "merge":
@@ -2489,49 +3290,112 @@ async def done_cmd(c, m):
         forward_chat = s.get("forward_chat")
         sessions.pop(uid, None)
         st = await m.reply("Starting...")
-        return asyncio.create_task(merge_job(c, m.chat.id, files, st, uid=uid,
-                                             forward_chat=forward_chat))
+        return start_operation(merge_job(c, m.chat.id, files, st, uid=uid,
+                                         forward_chat=forward_chat), uid=uid, status=st)
 
     # ---- bulk: resolve link ranges into video messages, then show the full action menu
     if s.get("pend"):
         c1, a = s.pop("pend")
         s.setdefault("ranges", []).append((c1, a, a))
-    st, skipped, errs = None, 0, []
     if s.get("ranges"):
-        st = await m.reply("🔎 Links se videos dhoond raha hu...")
-        for chat_, a, b in s["ranges"]:
-            try:
-                v, sk = await fetch_range(c, chat_, a, b)
-                s["files"].extend(v)
-                skipped += sk
-            except Exception as e:
-                errs.append(f"{chat_}: {str(e)[:150]}")
-        s["ranges"] = []
+        status = await m.reply("🔎 Videos count ho rahe hain...", reply_markup=stop_scan_kb())
+        return start_operation(resolve_bulk_ranges(c, uid, m.chat.id, s, status),
+                               uid=uid, status=status)
     if not s["files"]:
-        txt = "❌ Koi video nahi mila." + ("\n" + "\n".join(errs) if errs else "")
-        txt += "\nBot ko source group/channel me add karke message access verify karo." if errs else ""
         sessions.pop(uid, None)
-        return await (st.edit(txt) if st else m.reply(txt))
+        return await m.reply("❌ Koi video nahi mila.")
     files = s.pop("files")
     s.pop("mode", None)
     s["bulkfiles"], s["single"] = files, files[0]
     note = f"✅ {len(files)} videos mil gayi"
     if s.get("forward_chat"):
         note += f"\n📤 Extra channel: `{s['forward_chat']}`"
-    if skipped:
-        note += f"  ({skipped} text/file/non-video skip)"
-    if errs:
-        note += "\n⚠️ " + "\n⚠️ ".join(errs)
     text, kb = menu_view(uid, s)
-    if st:
-        await st.edit(note + "\n\n" + text, reply_markup=kb)
-    else:
-        await m.reply(note + "\n\n" + text, reply_markup=kb)
+    await m.reply(note + "\n\n" + text, reply_markup=kb)
 
 
 @app.on_message(filters.private & allowed & filters.text, group=1)
 async def on_text(c, m):
     uid = m.from_user.id
+    pdf_request = pdf_requests.get(uid)
+    if pdf_request and pdf_request.get("wait") in ("remove_text", "add_text") and not m.text.startswith("/"):
+        text = m.text.strip()
+        if not text or len(text) > 80 or any(ord(char) < 32 for char in text):
+            return await m.reply("❌ 1–80 characters ka normal text bhejein.")
+        action = "remove" if pdf_request["wait"] == "remove_text" else "add"
+        source_message = pdf_request["message"]
+        pdf_requests.pop(uid, None)
+        warning = ("⚠️ Exact text-watermark matches redact honge. Neeche ka original content bhi "
+                   "affected ho sakta hai; flattened/scanned watermark automatically remove nahi hota.\n\n"
+                   if action == "remove" else "")
+        status = await m.reply(f"{warning}⏳ PDF process ho rahi hai...")
+        start_operation(pdf_watermark_job(
+            c, uid, source_message, action, text, status), uid=uid, status=status)
+        return
+
+    image_request = image_requests.get(uid)
+    if image_request and image_request.get("wait") == "resolution" and not m.text.startswith("/"):
+        try:
+            resolution = custom_image_resolution(m.text)
+        except ValueError as e:
+            return await m.reply(f"❌ {e}")
+        image_request.pop("wait", None)
+        status = await m.reply("⏳ Photo resize ho rahi hai...")
+        start_operation(image_action_job(
+            c, uid, image_request["message"], "resize", resolution, status),
+            uid=uid, status=status)
+        return
+
+    s = sessions.get(uid)
+    if s and s.get("wait") == "fileextract" and not m.text.startswith("/"):
+        try:
+            urls = direct_urls(m.text)
+        except (ValueError, OSError) as e:
+            return await m.reply(f"❌ {e}")
+        if len(urls) != 1:
+            return await m.reply("❌ Ek baar me ek archive URL bhejein.")
+        sessions.pop(uid, None)
+        status = await m.reply("📥 Archive extraction starting...")
+        return start_operation(
+            archive_url_job(c, uid, m.chat.id, urls, "extract", None, status),
+            uid=uid, status=status)
+
+    if uid in bot_admin_wait and not m.text.startswith("/"):
+        values = m.text.strip().split("|", 1)
+        if len(values) != 2 or not values[0].strip() or not values[1].strip():
+            return await m.reply("❌ Format: `Bot Name | https://t.me/botusername`")
+        name, url = values[0].strip(), values[1].strip()
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        try:
+            parsed = urlsplit(url)
+            valid_url = (parsed.scheme == "https" and bool(parsed.hostname)
+                         and parsed.username is None and parsed.password is None
+                         and not any(char.isspace() for char in url)
+                         and not any(ord(char) < 32 for char in name))
+            if parsed.port is not None:
+                valid_url = False
+        except ValueError:
+            valid_url = False
+        if not valid_url or len(name) > 40 or len(url) > 300:
+            return await m.reply(
+                "❌ Naam 40 characters tak rakhein aur valid HTTPS bot link bhejein "
+                "(jaise `Video Bot | https://t.me/videobot`).")
+        try:
+            bots = await get_other_bots()
+            if any(bot["url"].casefold() == url.casefold() for bot in bots):
+                return await m.reply("Ye bot pehle se list me hai. Dusra link bhejein ya /cancel karein.")
+            bots.append({"id": uuid.uuid4().hex[:12], "name": name, "url": url})
+            await save_other_bots(bots)
+        except Exception:
+            logging.exception("Failed to add an other bot link")
+            return await m.reply("❌ Bot save nahi hua. Storage connection check karein.")
+        bot_admin_wait.discard(uid)
+        text, keyboard = await other_bots_view(uid, "✅ Bot add ho gaya. Ab ye sab users ko dikhega.")
+        return await m.reply(text, reply_markup=keyboard)
+    if uid in bot_admin_wait:
+        return
+
     copy_request = channel_copy_requests.get(uid)
     if copy_request and not m.text.startswith("/"):
         if copy_request["step"] == "source":
@@ -2571,11 +3435,14 @@ async def on_text(c, m):
             if source_chat.id == destination.id:
                 return await m.reply("❌ Source aur destination channel alag hone chahiye.")
         except Exception as e:
-            return await m.reply(f"❌ Channel access/permission check fail: {str(e)[-250:]}")
+            detail = channel_access_hint(e)
+            extra = f"\n{channel_access_hint_text()}" if "USER_NOT_PARTICIPANT" in str(e) else ""
+            return await m.reply(f"❌ Channel access/permission check fail: {detail[-250:]}{extra}")
         request = channel_copy_requests.pop(uid)
         status = await m.reply("⏳ Channel-copy job queue me add hua.")
-        asyncio.create_task(run_channel_copy(
-            c, source_chat.id, request["first"], request["last"], destination.id, status))
+        start_operation(run_channel_copy(
+            c, source_chat.id, request["first"], request["last"], destination.id, status),
+            uid=uid, status=status)
         return
 
     s = sessions.get(uid)
@@ -2588,7 +3455,9 @@ async def on_text(c, m):
         s["wait"] = None
         if mode == "extract":
             status = await m.reply("⏳ Archive extraction starting...")
-            return asyncio.create_task(archive_url_job(c, uid, m.chat.id, urls, mode, None, status))
+            return start_operation(
+                archive_url_job(c, uid, m.chat.id, urls, mode, None, status),
+                uid=uid, status=status)
         s["archive_urls"] = urls
         return await m.reply("Archive format choose karo:", reply_markup=archive_format_kb())
     if s and s.get("mode") == "bulk" and not m.text.startswith("/"):
@@ -2596,9 +3465,26 @@ async def on_text(c, m):
         if links:
             return await add_links(m, s, links)
     if (not s or not s.get("wait")) and not m.text.startswith("/"):
-        url = social_video_url(m.text)
-        if url:
-            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        urls = extract_http_urls(m.text)
+        if len(urls) > 20:
+            return await m.reply("❌ Ek message me maximum 20 URL bhejein.")
+        if len(urls) > 1:
+            try:
+                for link in urls:
+                    validate_public_url(link)
+            except (ValueError, OSError) as e:
+                return await m.reply(f"❌ {e}")
+            url_bundle_requests[uid] = {"urls": urls, "source": m}
+            return await m.reply(
+                f"📦 {len(urls)} links mile. Sab files ko kis archive format me pack karna hai?",
+                reply_markup=url_bundle_format_kb())
+        if urls:
+            url = urls[0]
+            try:
+                parsed = urlsplit(url)
+                host = (parsed.hostname or "").lower().rstrip(".")
+            except ValueError:
+                return await m.reply("❌ Valid URL bhejein.")
             if host in {"youtube.com", "www.youtube.com", "m.youtube.com",
                         "music.youtube.com", "youtu.be"}:
                 status = await m.reply(
@@ -2606,7 +3492,19 @@ async def on_text(c, m):
                     reply_markup=youtube_quality_kb())
                 social_requests[uid] = {"url": url, "source": m, "status": status}
                 return
-            return asyncio.create_task(social_video_job(c, uid, m.chat.id, url, m))
+            if host in SOCIAL_HOSTS and host != "drive.usercontent.google.com":
+                if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+                    return await m.reply("❌ Media links ke liye valid HTTPS URL bhejein.")
+                return start_operation(social_video_job(c, uid, m.chat.id, url, m), uid=uid)
+            if direct_file_url(url) or host == "drive.usercontent.google.com":
+                try:
+                    validate_public_url(url)
+                except (ValueError, OSError) as e:
+                    return await m.reply(f"❌ {e}")
+                status = await m.reply("📥 Direct file download starting...")
+                return start_operation(
+                    archive_url_job(c, uid, m.chat.id, [url], "auto", None, status),
+                    uid=uid, status=status)
     if not s or not s.get("wait") or m.text.startswith("/"):
         return
     w, txt = s["wait"], m.text.strip()
@@ -2718,6 +3616,99 @@ async def cb(c, q):
         return await pick_cb(c, q, s, k)
     await q.answer()
 
+    if k[0] == "op" and k[1] == "cancel":
+        task_count, job_count = await cancel_operations(uid)
+        clear_user_interactions(uid)
+        return await q.message.edit(
+            f"🛑 Your jobs stopped: {job_count} job(s), {task_count} task(s).")
+
+    if k[0] == "pdf":
+        request = pdf_requests.get(uid)
+        if not request:
+            return await q.message.edit("PDF session expire ho gaya. PDF dobara bhejein.")
+        if k[1] == "keep":
+            pdf_requests.pop(uid, None)
+            return await q.message.edit("📄 Original PDF rakha gaya; koi watermark change nahi kiya.")
+        if k[1] == "remove":
+            request["wait"] = "remove_text"
+            return await q.message.edit(
+                "Remove karne ke liye watermark par likha **exact text** bhejein.\n\n"
+                "Note: ye searchable text watermark ke matches redact karega. "
+                "Scanned/flattened watermark auto-remove nahi ho sakta.")
+        if k[1] == "add":
+            request["wait"] = "add_text"
+            return await q.message.edit("PDF par add karne ke liye watermark text bhejein (max 80 characters).")
+        return await q.message.edit("PDF option valid nahi hai.")
+
+    if k[0] == "img":
+        request = image_requests.get(uid)
+        if k[1] == "cancel":
+            image_requests.pop(uid, None)
+            return await q.message.edit("Photo tools band kar diye.")
+        if not request:
+            return await q.message.edit("Photo session expire ho gaya. Photo dobara bhejein.")
+        source_message = request["message"]
+        if k[1] == "menu":
+            return await q.message.edit(
+                "🖼️ **Photo Tools**\n\nThumbnail set karein, format badlein, file size kam karein, ya resolution resize karein.",
+                reply_markup=image_tools_kb())
+        if k[1] == "formats":
+            return await q.message.edit("Output format choose karein:", reply_markup=image_format_kb())
+        if k[1] == "sizes":
+            return await q.message.edit(
+                "JPEG file target size choose karein. Bot image quality/resolution adjust karke selected size se chhoti file banane ki koshish karega.",
+                reply_markup=image_size_kb())
+        if k[1] == "resolutions":
+            return await q.message.edit(
+                "Maximum resolution choose karein. Original aspect ratio preserve rahega; image stretch nahi hogi.",
+                reply_markup=image_resolution_kb())
+        if k[1] == "custom":
+            request["wait"] = "resolution"
+            return await q.message.edit(
+                "Custom maximum resolution bhejein: `width x height`\nExample: `1200x800` (max 40 megapixels).")
+        if k[1] == "thumb":
+            image_requests.pop(uid, None)
+            await q.message.edit("⏳ Custom thumbnail save ho raha hai...")
+            try:
+                await save_thumb(c, q.message, source_message, notify=False)
+                return await q.message.edit("✅ Thumbnail save ho gaya. Video uploads par lagega.\nHatane ke liye /delthumb.")
+            except Exception as e:
+                logging.exception("Could not save photo as thumbnail for user %s", uid)
+                return await q.message.edit(f"❌ Thumbnail save nahi hua:\n`{str(e)[-300:]}`")
+        if k[1] == "convert" and len(k) == 3 and k[2] in ("jpg", "png", "svg", "pdf"):
+            action, value = "convert", k[2]
+        elif k[1] == "compress" and len(k) == 3 and k[2] in ("20", "50", "100"):
+            action, value = "compress", k[2]
+        elif k[1] == "resize" and len(k) == 3:
+            if k[2] == "0x0":
+                action, value = "resize", (None, None)
+            else:
+                try:
+                    width, height = custom_image_resolution(k[2])
+                    action, value = "resize", (width, height)
+                except ValueError:
+                    return await q.message.edit("Resolution option valid nahi hai.")
+        else:
+            return await q.message.edit("Photo option valid nahi hai.")
+        image_requests.pop(uid, None)
+        await q.message.edit("⏳ Photo process ho rahi hai...")
+        return start_operation(
+            image_action_job(c, uid, source_message, action, value, q.message),
+            uid=uid, status=q.message)
+
+    if k[0] == "ub":
+        request = url_bundle_requests.get(uid)
+        if k[1] == "cancel":
+            url_bundle_requests.pop(uid, None)
+            return await q.message.edit("Link archive cancelled.")
+        if not request or k[1] not in ("zip", "7z", "rar", "tar.gz"):
+            return await q.message.edit("Link session expire ho gaya. URLs dobara bhejein.")
+        url_bundle_requests.pop(uid, None)
+        await q.message.edit(f"⏳ {len(request['urls'])} link(s) download karke {k[1].upper()} bana raha hoon...")
+        return start_operation(archive_url_job(
+            c, uid, chat, request["urls"], "create", k[1], q.message),
+            uid=uid, status=q.message)
+
     if k[0] == "dl":
         request = social_requests.pop(uid, None)
         if k[1] == "cancel":
@@ -2727,15 +3718,16 @@ async def cb(c, q):
         if not request or k[1] not in YOUTUBE_CHOICES:
             return await q.message.edit("Download choice expire ho gaya. Link dobara bhejo.")
         await q.message.edit("⏳ YouTube download starting...")
-        return asyncio.create_task(social_video_job(
-            c, uid, chat, request["url"], request["source"], k[1], q.message))
+        return start_operation(social_video_job(
+            c, uid, chat, request["url"], request["source"], k[1], q.message),
+            uid=uid, status=q.message)
 
     if k[0] == "a" and k[1] in ("url_extract", "url_create"):
         mode = "extract" if k[1] == "url_extract" else "create"
         s["wait"] = "archive_extract_urls" if mode == "extract" else "archive_create_urls"
         s.pop("archive_urls", None)
         prompt = ("📥 Archive ka direct URL bhejo (ZIP / 7Z / RAR / TAR)." if mode == "extract"
-                  else "📦 Ek ya multiple direct file URLs bhejo (har URL alag line par).")
+                  else "📦 Ek ya multiple direct file/media URLs bhejo (har URL alag line par).")
         kb = back_kb() if s.get("single") else KB([[P("Archive Tools", "s|archive")]])
         return await q.message.edit(prompt + "\n\nCancel: /cancel", reply_markup=kb)
     if k[0] == "ar":
@@ -2748,7 +3740,8 @@ async def cb(c, q):
             return await q.message.edit("Session expire. `/makearchive` dobara chalao.")
         s.pop("wait", None)
         await q.message.edit("⏳ Archive creation starting...")
-        return asyncio.create_task(archive_url_job(c, uid, chat, urls, "create", k[1], q.message))
+        return start_operation(archive_url_job(c, uid, chat, urls, "create", k[1], q.message),
+                               uid=uid, status=q.message)
 
     msg = s.get("single")
     if not msg:
@@ -2788,8 +3781,9 @@ async def cb(c, q):
                 forward_chat = s.get("forward_chat")
                 sessions.pop(uid, None)
                 await q.message.edit("Starting...")
-                return asyncio.create_task(merge_job(c, chat, files, q.message, uid=uid,
-                                                     forward_chat=forward_chat))
+                return start_operation(merge_job(c, chat, files, q.message, uid=uid,
+                                                 forward_chat=forward_chat),
+                                       uid=uid, status=q.message)
             drop_local(s)
             sessions[uid] = {"mode": "merge", "files": [msg]}
             await ed("🔗 Is video ko add kar liya. Aur videos bhejo, phir /done.")
@@ -2848,7 +3842,8 @@ async def cb(c, q):
                 await ed(pick_text(s["pick"]), pick_kb(s["pick"]))
             else:
                 drop_local(s)
-                asyncio.create_task(prefetch(c, uid, chat, msg, q.message, a))
+                start_operation(prefetch(c, uid, chat, msg, q.message, a),
+                                uid=uid, status=q.message)
 
     elif k[0] == "ce":  # caption & buttons editor
         if k[1] == "cap":
@@ -2895,6 +3890,7 @@ async def denied(c, m):
 async def main():
     try:
         await initialize_user_store()
+        await initialize_other_bots()
         await app.start()
         me = await app.get_me()
         print(f"\n✅ Bot chalu hai: @{me.username}  |  Owner ID: {OWNER_ID}", flush=True)
