@@ -643,7 +643,7 @@ COMMANDS_TXT = (
     "15. `/makearchive <URL>` — Direct ya supported media link(s) ko archive me pack karein.\n"
     "16. `/cancel` — Current file-processing session cancel karein.\n"
     "17. `/filecompress` — Multiple files ko ZIP/7Z/RAR/TAR.GZ me compress karein.\n"
-    "18. `/fileextract` — ZIP/7Z/RAR/TAR file ya direct archive URL extract karein.\n"
+    "18. `/fileextract` — ZIP/7Z/RAR/TAR ya unke parts bhejkar `/done` se extract karein.\n"
     "19. `/disclaimer` — Usage aur legal disclaimer dekhein.\n"
     "20. Multiple media links ek message me bhejein — format choose karke archive download karein.\n"
     "21. `/cancel` — Apne pending sessions aur active jobs stop karein.\n\n"
@@ -667,14 +667,14 @@ FUNCTIONS_TXT = (
     "9. Media information dekhein aur archive banayein.\n\n"
     "**🌐 URL aur Bulk tools**\n"
     "10. Direct URL se ZIP/7Z/RAR/TAR extract ya supported file/media URL(s) se archive create.\n"
-    "11. Public YouTube/Instagram video link bhej kar download karein.\n"
+    "11. Instagram aur supported media links bhej kar video ya MP3 download karein.\n"
     "12. `/bulk` se kai videos ya `t.me` video range process karein; `/done` par actions chunein.\n"
     "13. Original aur processed files permanent channel me jaati hain; bulk ke liye `/forward` se extra channel set karein.\n\n"
     "**⚙️ Personal settings**\n"
     "14. `/settings` me Upload as Video/File aur Rename File set karein.\n"
     "15. `/addthumb` se custom thumbnail set karein; `/delthumb` se remove karein.\n"
     "16. `/filecompress` se multiple documents/media ko ZIP, 7Z, RAR ya TAR.GZ me pack karein.\n"
-    "17. `/fileextract` se Telegram archive ya direct archive URL extract karke files paayein.\n"
+    "17. `/fileextract` se archive/parts bhejkar `/done` karein, ya direct archive URL extract karein.\n"
     "18. Photo bhej kar usse thumbnail set, JPG/PNG/SVG/PDF convert, 20/50/100 KB se chhota compress, ya resize karein.\n"
     "19. PDF bhej kar exact text watermark remove karne ki koshish, watermark add, ya original keep karein. Scanned watermark remove nahi hota.\n"
     "20. `/cancel` se apne active jobs rokein; bot owner `/stop` se sab users ke jobs rokh sakta hai.\n"
@@ -1606,6 +1606,46 @@ def _extract_zip(archive, destination):
                 shutil.copyfileobj(src, dst)
 
 
+def _extract_split_zip(archive, destination):
+    tool = _archive_tool("SEVENZIP_EXECUTABLE", ("7z", "7zz", "7za", "7z.exe"),
+                         (r"C:\Program Files\7-Zip\7z.exe",))
+    if not tool:
+        raise RuntimeError("Split ZIP extract karne ke liye server par 7-Zip install karein.")
+    listing = subprocess.run(
+        [tool, "l", "-slt", str(archive)], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120)
+    if listing.returncode:
+        raise RuntimeError(f"7-Zip archive check failed: {listing.stderr[-400:] or listing.stdout[-400:]}")
+    records = listing.stdout.split("----------", 1)
+    if len(records) < 2:
+        raise RuntimeError("7-Zip archive contents read nahi kar saka.")
+    entries = []
+    for block in re.split(r"\r?\n\s*\r?\n", records[1]):
+        fields = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(" = ")
+            if separator:
+                fields[key] = value
+        name = fields.get("Path")
+        if not name:
+            continue
+        entries.append(fields)
+        _safe_member_path(destination, name)
+        if fields.get("Symbolic Link") or fields.get("Hard Link"):
+            raise RuntimeError("Archive ke symbolic/hard links extract nahi kiye jaate.")
+    if len(entries) > MAX_ARCHIVE_FILES:
+        raise RuntimeError(f"Archive me {MAX_ARCHIVE_FILES} se zyada entries hain.")
+    total = sum(int(entry.get("Size", "0")) for entry in entries
+                if entry.get("Folder") != "+")
+    if total > MAX_EXTRACTED_BYTES:
+        raise RuntimeError(f"Extracted data MAX_EXTRACTED_BYTES ({human(MAX_EXTRACTED_BYTES)}) se badi hai.")
+    result = subprocess.run(
+        [tool, "x", "-y", "-bd", f"-o{destination}", str(archive)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+    if result.returncode:
+        raise RuntimeError(f"Split ZIP extraction failed: {result.stderr[-400:] or result.stdout[-400:]}")
+
+
 def _extract_tar(archive, destination):
     total = 0
     with tarfile.open(archive, "r:*") as tf:
@@ -1635,20 +1675,33 @@ def _extract_7z(archive, destination):
         import py7zr
     except ImportError as e:
         raise RuntimeError("7z support ke liye requirements.txt install karo (py7zr).") from e
-    with py7zr.SevenZipFile(archive, mode="r") as zf:
-        members = zf.list()
-        if len(members) > MAX_ARCHIVE_FILES:
-            raise RuntimeError(f"Archive me {MAX_ARCHIVE_FILES} se zyada entries hain.")
-        total = 0
-        for member in members:
-            _safe_member_path(destination, member.filename)
-            if getattr(member, "is_symlink", False):
-                raise RuntimeError("Archive ke symbolic links extract nahi kiye jaate.")
-            if not member.is_directory:
-                total += member.uncompressed or 0
-                if total > MAX_EXTRACTED_BYTES:
-                    raise RuntimeError(f"Extracted data MAX_EXTRACTED_BYTES ({human(MAX_EXTRACTED_BYTES)}) se badi hai.")
-        zf.extractall(path=destination)
+    volume_file = None
+    source = archive
+    if re.search(r"\.7z\.\d{3,}$", archive.name, re.IGNORECASE):
+        try:
+            import multivolumefile
+        except ImportError as e:
+            raise RuntimeError("Split 7z support ke liye requirements.txt update karo (multivolumefile).") from e
+        volume_file = multivolumefile.open(archive.with_suffix(""), mode="rb")
+        source = volume_file
+    try:
+        with py7zr.SevenZipFile(source, mode="r") as zf:
+            members = zf.list()
+            if len(members) > MAX_ARCHIVE_FILES:
+                raise RuntimeError(f"Archive me {MAX_ARCHIVE_FILES} se zyada entries hain.")
+            total = 0
+            for member in members:
+                _safe_member_path(destination, member.filename)
+                if getattr(member, "is_symlink", False):
+                    raise RuntimeError("Archive ke symbolic links extract nahi kiye jaate.")
+                if not member.is_directory:
+                    total += member.uncompressed or 0
+                    if total > MAX_EXTRACTED_BYTES:
+                        raise RuntimeError(f"Extracted data MAX_EXTRACTED_BYTES ({human(MAX_EXTRACTED_BYTES)}) se badi hai.")
+            zf.extractall(path=destination)
+    finally:
+        if volume_file:
+            volume_file.close()
 
 
 def _extract_rar(archive, destination):
@@ -1687,15 +1740,70 @@ def _extract_rar(archive, destination):
     except RuntimeError:
         raise
     except Exception as e:
+        detail = str(e)
+        if any(text in detail.lower() for text in (
+                "read enough data", "cannot open next volume", "unexpected end",
+                "volume not found", "partial file")):
+            raise RuntimeError(
+                "RAR ke parts incomplete, galat order me, ya corrupt hain. "
+                "Sabhi volumes (jaise .part01.rar, .part02.rar... ya .rar, .r00, .r01...) "
+                "ek hi baar me bhejkar /done karein. "
+                f"Archive detail: {detail[-250:]}") from e
         raise RuntimeError(f"RAR extraction failed; install UnRAR/7-Zip backend: {e}") from e
 
 
 def _archive_type(path):
     name = path.name.lower()
+    if re.search(r"\.7z\.\d{3,}$", name):
+        return ".7z"
+    if re.search(r"\.zip\.\d{3,}$", name) or re.search(r"\.z\d{2,}$", name):
+        return ".zip"
+    if re.search(r"\.r\d{2,}$", name):
+        return ".rar"
     for ext in (".tar.bz2", ".tar.gz", ".tar.xz", ".tbz2", ".tgz", ".txz", ".zip", ".7z", ".rar", ".tar"):
         if name.endswith(ext):
             return ext
     return ""
+
+
+def _archive_primary(paths):
+    if not paths:
+        raise RuntimeError("Archive ke saare parts bhejein.")
+    paths = [Path(path) for path in paths]
+    names = [path.name.lower() for path in paths]
+    patterns = (
+        (r"^(.*\.7z)\.(\d{3,})$", ".7z"),
+        (r"^(.*\.zip)\.(\d{3,})$", ".zip"),
+        (r"^(.*)\.part(\d+)\.rar$", ".rar"),
+    )
+    for pattern, ext in patterns:
+        matches = [(path, re.match(pattern, path.name, re.IGNORECASE)) for path in paths]
+        matches = [(path, match) for path, match in matches if match]
+        if matches:
+            prefixes = {match.group(1).casefold() for _, match in matches}
+            if len(prefixes) != 1 or len(matches) != len(paths):
+                raise RuntimeError("Ek baar me sirf ek archive ke saare parts bhejein.")
+            numbers = sorted(int(match.group(2)) for _, match in matches)
+            if numbers != list(range(1, len(numbers) + 1)):
+                raise RuntimeError("Archive parts incomplete hain. Part 001/01 se saare parts order me bhejein.")
+            return min(matches, key=lambda item: int(item[1].group(2)))[0]
+
+    rar_parts = [name for name in names if re.search(r"\.r\d{2,}$", name)]
+    zip_parts = [name for name in names if re.search(r"\.z\d{2,}$", name)]
+    if rar_parts or zip_parts:
+        ext = ".rar" if rar_parts else ".zip"
+        main = [path for path in paths if path.name.lower().endswith(ext)]
+        if len(main) != 1 or len(paths) != len(rar_parts or zip_parts) + 1:
+            raise RuntimeError(f"Multi-part {ext.upper()} archive ke main file aur saare parts bhejein.")
+        suffixes = sorted(int(re.search(r"\.(?:r|z)(\d{2,})$", name).group(1))
+                          for name in (rar_parts or zip_parts))
+        if suffixes != list(range(0 if ext == ".rar" else 1, suffixes[-1] + 1)):
+            raise RuntimeError("Archive parts incomplete hain. Missing volume(s) bhejein.")
+        return main[0]
+
+    if len(paths) != 1 or not _archive_type(paths[0]):
+        raise RuntimeError("ZIP, 7Z, RAR ya TAR archive ke saare parts bhejein.")
+    return paths[0]
 
 
 def _archive_tool(env_name, names, windows_paths=()):
@@ -1720,7 +1828,11 @@ def _extract_archive(archive, destination):
         raise RuntimeError("Archive format pehchaan nahi aaya. ZIP, 7z, RAR ya TAR link bhejo.")
     destination.mkdir(parents=True, exist_ok=True)
     if ext == ".zip":
-        _extract_zip(archive, destination)
+        if re.search(r"\.zip\.\d{3,}$", archive.name, re.IGNORECASE) or any(
+                archive.parent.glob(f"{archive.stem}.z[0-9][0-9]")):
+            _extract_split_zip(archive, destination)
+        else:
+            _extract_zip(archive, destination)
     elif ext == ".7z":
         _extract_7z(archive, destination)
     elif ext == ".rar":
@@ -1906,22 +2018,30 @@ async def file_compress_job(c, uid, chat, messages, archive_format, status):
         shutil.rmtree(d, ignore_errors=True)
 
 
-async def telegram_archive_extract_job(c, uid, chat, message, status):
+async def telegram_archive_extract_job(c, uid, chat, messages, status):
     d = WORK / uuid.uuid4().hex
     job = Job(uid, status)
     progress_task = asyncio.create_task(progress_watch(job))
     try:
         input_dir = d / "in"
         input_dir.mkdir(parents=True, exist_ok=True)
-        name = telegram_file_name(message)
-        await set_stage(job, "download", name)
-        path = await c.download_media(
-            message, file_name=str(input_dir / name), progress=prog_cb(job))
-        if not path:
-            raise RuntimeError("Archive Telegram se download nahi hui.")
+        paths = []
+        used_names = set()
+        for index, message in enumerate(messages, 1):
+            name = telegram_file_name(message)
+            if name.casefold() in used_names:
+                raise RuntimeError(f"Duplicate archive part filename: {name}")
+            used_names.add(name.casefold())
+            await set_stage(job, "download", f"Archive part {index}/{len(messages)}")
+            path = await c.download_media(
+                message, file_name=str(input_dir / name), progress=prog_cb(job, index))
+            if not path:
+                raise RuntimeError(f"Archive Telegram se download nahi hui: {name}")
+            paths.append(Path(path))
+        archive = _archive_primary(paths)
         out = d / "out"
         await set_stage(job, "convert", "Archive extract ho raha hai")
-        extracted = await asyncio.to_thread(_extract_archive, Path(path), out)
+        extracted = await asyncio.to_thread(_extract_archive, archive, out)
         for index, file_path in enumerate(extracted, 1):
             chk(job)
             await set_stage(job, "upload", f"Extracted file {index}/{len(extracted)}")
@@ -1959,17 +2079,23 @@ async def handle_file_utility_media(c, message):
         return True
     seen.add(message.id)
     if not message.document or not _archive_type(Path(telegram_file_name(message))):
-        await message.reply("❌ ZIP, 7Z, RAR ya TAR archive upload karein. Ya direct archive URL bhejein.")
+        await message.reply("❌ ZIP, 7Z, RAR ya TAR archive/volume upload karein. Ya direct archive URL bhejein.")
         return True
-    sessions.pop(uid, None)
-    status = await message.reply("📥 Archive extract ho raha hai...")
-    start_operation(telegram_archive_extract_job(c, uid, message.chat.id, message, status),
-                    uid=uid, status=status)
+    archives = session.setdefault("archive_messages", [])
+    filename = telegram_file_name(message).casefold()
+    if any(telegram_file_name(item).casefold() == filename for item in archives):
+        await message.reply(f"⚠️ `{telegram_file_name(message)}` pehle add ho chuka hai.")
+        return True
+    archives.append(message)
+    await message.reply(
+        f"✅ Archive part added #{len(archives)}. Baaki parts bhejein, phir /done karein.")
     return True
 
 
-SOCIAL_HOSTS = {
+YOUTUBE_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+}
+SOCIAL_HOSTS = {
     "instagram.com", "www.instagram.com", "instagr.am",
     "drive.google.com", "drive.usercontent.google.com", "docs.google.com",
     "terabox.com", "www.terabox.com", "1024terabox.com", "www.1024terabox.com",
@@ -1990,7 +2116,7 @@ DIRECT_FILE_EXTS = SOCIAL_MEDIA_EXTS | {
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz",
 }
-YOUTUBE_CHOICES = {
+SOCIAL_DOWNLOAD_CHOICES = {
     "best": "bestvideo*+bestaudio/best",
     "2160": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
     "1440": "bestvideo[height<=1440]+bestaudio/best[height<=1440]",
@@ -2024,7 +2150,7 @@ def direct_file_url(text):
     return candidate if extension in DIRECT_FILE_EXTS else None
 
 
-def youtube_quality_kb():
+def social_download_kb():
     return KB([[G("Best", "dl|best"), G("2160p", "dl|2160"), G("1440p", "dl|1440")],
                [G("1080p", "dl|1080"), G("720p", "dl|720"), G("480p", "dl|480")],
                [G("360p", "dl|360"), G("🎵 MP3", "dl|mp3")],
@@ -2072,7 +2198,7 @@ def _download_mega(url, destination, job):
 
 
 def _download_social_video(url, destination, job, choice="best"):
-    if choice not in YOUTUBE_CHOICES:
+    if choice not in SOCIAL_DOWNLOAD_CHOICES:
         raise ValueError("Download quality option valid nahi hai.")
     if (urlsplit(url).hostname or "").lower().rstrip(".") in {"mega.nz", "www.mega.nz"}:
         return _download_mega(url, destination, job)
@@ -2091,7 +2217,7 @@ def _download_social_video(url, destination, job, choice="best"):
         job.total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
 
     options = {
-        "format": YOUTUBE_CHOICES[choice],
+        "format": SOCIAL_DOWNLOAD_CHOICES[choice],
         "merge_output_format": "mp4",
         "outtmpl": str(destination / "%(title).100B [%(id)s].%(ext)s"),
         "noplaylist": True,
@@ -2130,36 +2256,15 @@ def _download_social_video(url, destination, job, choice="best"):
     return path, info.get("title") or path.name
 
 
-def youtube_download_hint(url, error, choice="best"):
-    host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    detail = str(error)
-    if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
-        if any(text in detail.lower() for text in (
-                "sign in to confirm", "not a bot", "confirm you're not a bot",
-                "cookies-from-browser", "login required")):
-            return RuntimeError(
-                "YouTube ne server ko sign-in/anti-bot check par rok diya. "
-                "Owner ko apne YouTube account se Netscape cookies export karke server par "
-                "securely rakhni hongi, phir YTDLP_COOKIES me us file ka path set karke bot restart karein. "
-                "Cookies kisi aur ko share na karein. YouTube access phir bhi guaranteed nahi hai.")
-        if choice == "mp3" and any(text in detail.lower() for text in (
-                "ffmpeg", "ffprobe", "postprocessing")):
-            return RuntimeError(
-                "MP3 conversion fail hui: server par FFmpeg install karke PATH me add karein, "
-                "phir bot restart karein.")
-    return error
-
-
 async def download_url_for_archive(url, destination, job):
     host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host in YOUTUBE_HOSTS:
+        raise RuntimeError("YouTube downloads supported nahi hain.")
     if host == "drive.usercontent.google.com":
         return await download_direct(url, destination, job)
     if host in SOCIAL_HOSTS:
-        try:
-            path, _ = await asyncio.to_thread(_download_social_video, url, destination, job)
-            return path
-        except Exception as e:
-            raise youtube_download_hint(url, e) from e
+        path, _ = await asyncio.to_thread(_download_social_video, url, destination, job)
+        return path
     return await download_direct(url, destination, job)
 
 
@@ -2198,7 +2303,7 @@ async def social_video_job(c, uid, chat, url, source_message, choice="best", sta
         await fail(status, job, Cancelled())
         raise
     except Exception as e:
-        await fail(status, job, youtube_download_hint(url, e, choice))
+        await fail(status, job, e)
     finally:
         await stop_progress_watch(progress_task)
         jobs.pop(job.id, None)
@@ -2395,12 +2500,40 @@ async def send_out(c, chat, p: Path, cap=None, job=None, idx=0, uid=None, reply_
     elif e in (".mp4", ".m4v"):
         info = await probe(p)
         thumb = ut or await make_thumb(p, info["dur"])  # custom thumbnail, else the usual auto cover
-        await c.send_video(chat, str(p), caption=cap, supports_streaming=True, duration=int(info["dur"]),
-                           width=info["w"], height=info["h"], thumb=thumb, **kw)
+        try:
+            await c.send_video(chat, str(p), caption=cap, supports_streaming=True, duration=int(info["dur"]),
+                               width=info["w"], height=info["h"], thumb=thumb, **kw)
+        except Exception as error:
+            if "IMAGE_PROCESS_FAILED" not in str(error):
+                raise
+            logging.warning("Telegram rejected video thumbnail; retrying without it: %s", p.name)
+            try:
+                await c.send_video(chat, str(p), caption=cap, supports_streaming=True,
+                                   duration=int(info["dur"]), width=info["w"], height=info["h"], **kw)
+            except Exception as retry_error:
+                if "IMAGE_PROCESS_FAILED" not in str(retry_error):
+                    raise
+                try:
+                    await c.send_document(chat, str(p), caption=cap, **tkw, **kw)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Telegram video upload failed ({retry_error}); "
+                        f"document fallback also failed ({fallback_error})") from fallback_error
     elif e in (".mp3", ".m4a", ".flac"):
         await c.send_audio(chat, str(p), caption=cap, **kw)
     elif e in IMG:
-        await c.send_photo(chat, str(p), caption=cap, **kw)
+        try:
+            await c.send_photo(chat, str(p), caption=cap, **kw)
+        except Exception as error:
+            if "IMAGE_PROCESS_FAILED" not in str(error):
+                raise
+            logging.warning("Telegram photo processing failed; retrying as document: %s", p.name)
+            try:
+                await c.send_document(chat, str(p), caption=cap, **tkw, **kw)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Telegram could not send image as photo ({error}); "
+                    f"document fallback also failed ({fallback_error})") from fallback_error
     else:
         await c.send_document(chat, str(p), caption=cap, **tkw, **kw)
     chk(job)
@@ -2412,7 +2545,15 @@ async def deliver(c, chat, files, job, uid, parallel=False, reply_to=None):
         await set_stage(job, "upload", f"{len(files)} photos")
         M = InputMediaPhoto if st["as_video"] else InputMediaDocument
         for i in range(0, len(files), 10):
-            await c.send_media_group(chat, [M(str(f)) for f in files[i:i + 10]], **rkw(reply_to))
+            batch = files[i:i + 10]
+            try:
+                await c.send_media_group(chat, [M(str(f)) for f in batch], **rkw(reply_to))
+            except Exception as error:
+                if M is not InputMediaPhoto or "IMAGE_PROCESS_FAILED" not in str(error):
+                    raise
+                logging.warning("Telegram photo album processing failed; retrying as documents.")
+                for path in batch:
+                    await c.send_document(chat, str(path), caption=path.name, **rkw(reply_to))
             chk(job)
     elif parallel and len(files) > 1:  # all uploads at the same time
         await set_stage(job, "upload", f"{len(files)} files parallel")
@@ -2856,13 +2997,15 @@ def channel_access_hint(error):
     detail = str(error)
     if "USER_NOT_PARTICIPANT" in detail or error.__class__.__name__ == "UserNotParticipant":
         return ("Telegram `USER_NOT_PARTICIPANT`: bot account itself is not a member of the "
-                "source channel. Add this bot to that channel, then retry.")
+                "source channel. A public link or invite link does not add the bot automatically; "
+                "a channel admin must add this bot, then retry.")
     return detail
 
 
 def channel_access_hint_text():
     return ("Private source channel ke liye aapka personal account join hona enough nahi hai. "
-            "Bot account ko bhi source me add karke messages dekhne ki access dein.")
+            "Public channel link ya invite link se bot khud join nahi kar sakta; "
+            "channel admin ko bot account add karke messages dekhne ki access deni hogi.")
 
 
 def parse_links(txt):
@@ -3062,7 +3205,7 @@ async def channelcopy_cmd(c, m):
         "📦 **Channel media copy**\n\n"
         "Start aur end message link bhejo (ek message me dono ya alag-alag):\n"
         "`https://t.me/channel/119` `https://t.me/channel/220`\n\n"
-        "Private source ke liye bot account ko channel me add karein (aapka personal account join hona enough nahi hai); bot khud join nahi karega. "
+        "Public/private source ke liye channel admin bot account ko add karein; link bhejne se bot khud join nahi karega. "
         "Phir destination channel ID / `@username` bhejein. Bot destination me admin hona chahiye.\n"
         f"Ek range max {MAX_RANGE} messages hai. Deleted/non-media/protected messages skip honge; "
         f"copies ke beech kam se kam {CHANNEL_COPY_GAP:g}s gap rahega.\n"
@@ -3211,10 +3354,12 @@ async def fileextract_cmd(c, m):
         return start_operation(
             archive_url_job(c, m.from_user.id, m.chat.id, urls, "extract", None, status),
             uid=m.from_user.id, status=status)
-    sessions[m.from_user.id] = {"wait": "fileextract", "file_message_ids": set()}
+    sessions[m.from_user.id] = {
+        "wait": "fileextract", "file_message_ids": set(), "archive_messages": []}
     await m.reply(
         "📥 **File Extract Mode ON**\n\n"
-        "ZIP, 7Z, RAR ya TAR archive upload karein, ya direct archive URL bhejein.\n"
+        "ZIP, 7Z, RAR ya TAR archive ke saare parts upload karein, phir /done karein. "
+        "Ek file ho tab bhi /done dabayein. Direct archive URL bhi bhej sakte hain.\n"
         "Cancel: /cancel")
 
 
@@ -3276,6 +3421,15 @@ async def stop_all_cmd(c, m):
 async def done_cmd(c, m):
     uid = m.from_user.id
     s = sessions.get(uid)
+    if s and s.get("wait") == "fileextract":
+        messages = s.get("archive_messages", [])
+        if not messages:
+            return await m.reply("Pehle archive ya uske saare parts bhejein.")
+        sessions.pop(uid, None)
+        status = await m.reply(f"📥 {len(messages)} archive part(s) ka extraction start ho raha hai...")
+        return start_operation(
+            telegram_archive_extract_job(c, uid, m.chat.id, messages, status),
+            uid=uid, status=status)
     if s and s.get("mode") in ("filecompress", "filecompress_select"):
         if not s.get("files"):
             return await m.reply("Pehle compress karne ke liye files bhejein.")
@@ -3485,17 +3639,18 @@ async def on_text(c, m):
                 host = (parsed.hostname or "").lower().rstrip(".")
             except ValueError:
                 return await m.reply("❌ Valid URL bhejein.")
-            if host in {"youtube.com", "www.youtube.com", "m.youtube.com",
-                        "music.youtube.com", "youtu.be"}:
-                status = await m.reply(
-                    "🎞 YouTube quality ya audio format choose karo:",
-                    reply_markup=youtube_quality_kb())
-                social_requests[uid] = {"url": url, "source": m, "status": status}
-                return
+            if host in YOUTUBE_HOSTS:
+                return await m.reply("❌ YouTube downloads supported nahi hain.")
             if host in SOCIAL_HOSTS and host != "drive.usercontent.google.com":
                 if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
                     return await m.reply("❌ Media links ke liye valid HTTPS URL bhejein.")
-                return start_operation(social_video_job(c, uid, m.chat.id, url, m), uid=uid)
+                if host in {"mega.nz", "www.mega.nz"}:
+                    return start_operation(social_video_job(c, uid, m.chat.id, url, m), uid=uid)
+                status = await m.reply(
+                    "🎞 Download quality ya audio format choose karo:",
+                    reply_markup=social_download_kb())
+                social_requests[uid] = {"url": url, "source": m, "status": status}
+                return
             if direct_file_url(url) or host == "drive.usercontent.google.com":
                 try:
                     validate_public_url(url)
@@ -3713,11 +3868,11 @@ async def cb(c, q):
         request = social_requests.pop(uid, None)
         if k[1] == "cancel":
             if request:
-                await q.message.edit("YouTube download cancelled.")
+                await q.message.edit("Media download cancelled.")
             return
-        if not request or k[1] not in YOUTUBE_CHOICES:
+        if not request or k[1] not in SOCIAL_DOWNLOAD_CHOICES:
             return await q.message.edit("Download choice expire ho gaya. Link dobara bhejo.")
-        await q.message.edit("⏳ YouTube download starting...")
+        await q.message.edit("⏳ Media download starting...")
         return start_operation(social_video_job(
             c, uid, chat, request["url"], request["source"], k[1], q.message),
             uid=uid, status=q.message)
